@@ -64,7 +64,7 @@ def _embed_missing(config: Config, store: Store) -> int:
     if backend is None:
         print(
             "No embedding backend installed; keyword search remains active.\n"
-            "Install one with:  pip install 'bindery-mcp[semantic]'",
+            "Install one with:  uv tool install --force 'bindery-mcp[semantic]'",
             file=sys.stderr,
         )
         return 0
@@ -133,7 +133,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         problems.append(f"vault has no indexed Markdown notes: {config.vault}")
     if config.semantic and backend is None:
         problems.append("semantic search requested but no backend installed "
-                        "(pip install 'bindery-mcp[semantic]') - keyword search still works")
+                        "(uv tool install --force 'bindery-mcp[semantic]') - keyword search still works")
     if backend is not None and stats["vectors"] < stats["chunks"]:
         problems.append(f"{stats['chunks'] - stats['vectors']} passage(s) not embedded yet "
                         "(run: bindery index --embed)")
@@ -242,6 +242,32 @@ It is not scratch space - what you write, the next session reads.
 """
 
 
+def _server_command() -> tuple[str, list[str]]:
+    """How an agent should start *this* installation of the server.
+
+    Asking PATH for ``bindery`` is not the same question. PATH can resolve to a
+    different copy than the one now running - an activated project virtualenv,
+    or one left behind by an earlier install elsewhere - and the agents would
+    then be pointed at a server the user did not just install, or at a path
+    that disappears when that virtualenv does. The console script sitting
+    beside the running interpreter is unambiguous, so prefer it, and fall back
+    to ``python -m`` for installs that have no script at all.
+    """
+    beside = Path(sys.executable).parent / "bindery"
+    if not beside.exists():
+        beside = beside.with_suffix(".exe")
+    found = shutil.which("bindery")
+    if beside.exists():
+        # Same file reached two ways: prefer the PATH name, which is the
+        # stable one users and uv keep pointing at across upgrades.
+        if found and Path(found).resolve() == beside.resolve():
+            return found, []
+        return str(beside), []
+    if found:
+        return found, []
+    return sys.executable, ["-m", "bindery"]
+
+
 def _client_targets(config: Config, scope: str = "user") -> dict[str, dict]:
     """Config payloads for every supported client, keyed by client id.
 
@@ -252,9 +278,7 @@ def _client_targets(config: Config, scope: str = "user") -> dict[str, dict]:
     checkout and be missing everywhere else, while Codex saw it everywhere -
     so user scope is the default for both, and project scope is opt-in.
     """
-    executable = shutil.which("bindery") or f"{sys.executable} -m bindery"
-    parts = executable.split()
-    command, extra = parts[0], parts[1:]
+    command, extra = _server_command()
     args = [*extra, "serve"]
     env = {"BINDERY_VAULT": str(config.vault)}
     claude_path = (

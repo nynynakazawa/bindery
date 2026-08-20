@@ -274,6 +274,58 @@ def test_both_agents_default_to_the_same_scope(config):
     assert {spec["scope"] for spec in targets.values()} == {"user"}
 
 
+def test_server_command_prefers_the_running_installation(tmp_path, monkeypatch):
+    """PATH can point at a different copy than the one being installed."""
+    import bindery.cli as cli
+
+    running = tmp_path / "uvtool" / "bin"
+    running.mkdir(parents=True)
+    (running / "python").touch()
+    (running / "bindery").touch()
+    stale = tmp_path / "other" / "bindery"
+    stale.parent.mkdir(parents=True)
+    stale.touch()
+
+    monkeypatch.setattr(cli.sys, "executable", str(running / "python"))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: str(stale))
+
+    command, extra = cli._server_command()
+    assert command == str(running / "bindery")
+    assert extra == []
+
+
+def test_server_command_prefers_the_path_name_for_the_same_file(tmp_path, monkeypatch):
+    """A symlink on PATH is the stable name for the same install - use it."""
+    import bindery.cli as cli
+
+    running = tmp_path / "uvtool" / "bin"
+    running.mkdir(parents=True)
+    (running / "python").touch()
+    real = running / "bindery"
+    real.touch()
+    link = tmp_path / "bin" / "bindery"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+
+    monkeypatch.setattr(cli.sys, "executable", str(running / "python"))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: str(link))
+
+    assert cli._server_command()[0] == str(link)
+
+
+def test_server_command_falls_back_to_module_execution(tmp_path, monkeypatch):
+    """No console script anywhere: `python -m bindery` still starts the server."""
+    import bindery.cli as cli
+
+    interpreter = tmp_path / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    monkeypatch.setattr(cli.sys, "executable", str(interpreter))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+
+    assert cli._server_command() == (str(interpreter), ["-m", "bindery"])
+
+
 def test_prompt_block_is_client_neutral(capsys):
     from bindery.cli import main
 
