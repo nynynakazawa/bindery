@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -91,11 +91,16 @@ CREATE INDEX IF NOT EXISTS queries_ts ON queries(ts);
 -- rebuilt on every reindex while a note's path is stable. Keying on chunk id
 -- would silently reset everything the system had learned each time a file was
 -- edited.
+-- `impressions` counts appearing in a result list; `uses` counts being read
+-- afterwards. Conflating them is how a retrieval system teaches itself that
+-- whatever it already ranks highly is what people want.
 CREATE TABLE IF NOT EXISTS usage (
-    path      TEXT PRIMARY KEY,
-    uses      INTEGER NOT NULL DEFAULT 0,
-    last_used REAL NOT NULL DEFAULT 0,
-    pinned    INTEGER NOT NULL DEFAULT 0
+    path        TEXT PRIMARY KEY,
+    uses        INTEGER NOT NULL DEFAULT 0,
+    impressions INTEGER NOT NULL DEFAULT 0,
+    last_used   REAL NOT NULL DEFAULT 0,
+    last_shown  REAL NOT NULL DEFAULT 0,
+    pinned      INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -161,6 +166,27 @@ class Store:
         with self.write():
             self.set_meta("schema_version", str(SCHEMA_VERSION))
 
+    #: Columns added to `usage` after it shipped. It is the one table a schema
+    #: change must not drop - retrieval history exists nowhere else and cannot
+    #: be rebuilt from the vault - so it is migrated in place instead.
+    _USAGE_COLUMNS = {
+        "impressions": "INTEGER NOT NULL DEFAULT 0",
+        "last_shown": "REAL NOT NULL DEFAULT 0",
+    }
+
+    def _add_missing_columns(self) -> None:
+        try:
+            existing = {
+                row[1] for row in self.conn.execute("PRAGMA table_info(usage)")
+            }
+        except sqlite3.DatabaseError:
+            return
+        if not existing:
+            return
+        for column, spec in self._USAGE_COLUMNS.items():
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE usage ADD COLUMN {column} {spec}")
+
     def _enable_wal(self) -> None:
         """Turn on WAL, tolerating the race between simultaneous first opens.
 
@@ -197,6 +223,7 @@ class Store:
             return
         if row is None or str(row[0]) == str(SCHEMA_VERSION):
             return
+        self._add_missing_columns()
         for statement in (
             "DROP TABLE IF EXISTS chunks_fts",
             "DROP TABLE IF EXISTS vectors",
@@ -471,8 +498,36 @@ class Store:
                 (text, time.time(), hits, agent),
             )
 
+    def record_impressions(self, paths: list[str]) -> None:
+        """Note that these passages were *shown*. Not that they helped.
+
+        This used to be counted as usage and fed straight back into ranking,
+        which is a feedback loop with no ground truth in it: a note that ranks
+        third gets shown, shown becomes a point, points raise the rank, and the
+        note keeps being shown. Whether it ever answered anything never enters
+        into it. Impressions are still worth recording - they are what makes
+        "shown constantly, never opened" a detectable state - but they do not
+        move the ranking.
+        """
+        import time
+
+        now = time.time()
+        with self.write():
+            for path in paths:
+                self.conn.execute(
+                    "INSERT INTO usage(path, impressions, last_shown) VALUES(?,1,?) "
+                    "ON CONFLICT(path) DO UPDATE SET "
+                    "impressions = impressions + 1, last_shown = ?",
+                    (path, now, now),
+                )
+
     def record_use(self, paths: list[str]) -> None:
-        """Count a retrieval against every note that supplied a passage."""
+        """Count a passage that an agent actually went on to read in full.
+
+        Following a search result to the note behind it is the closest thing
+        to a statement of usefulness this system can observe without asking
+        anyone. It is the only signal that raises a note's ranking.
+        """
         import time
 
         now = time.time()
@@ -489,6 +544,24 @@ class Store:
             r["path"]: (int(r["uses"]), float(r["last_used"]), int(r["pinned"]))
             for r in self.conn.execute("SELECT path, uses, last_used, pinned FROM usage")
         }
+
+    def shown_but_unread(self, *, minimum: int = 5, limit: int = 10):
+        """Notes that keep turning up in results and are never opened.
+
+        Either they answer the question in the passage alone - fine - or they
+        are matching queries they have nothing to say about, which is the
+        failure the old feedback loop would have entrenched rather than
+        surfaced.
+        """
+        return [
+            (r["path"], int(r["impressions"]))
+            for r in self.conn.execute(
+                "SELECT path, impressions FROM usage "
+                "WHERE uses = 0 AND pinned = 0 AND impressions >= ? "
+                "ORDER BY impressions DESC LIMIT ?",
+                (minimum, limit),
+            )
+        ]
 
     def set_pinned(self, path: str, pinned: bool) -> None:
         with self.write():

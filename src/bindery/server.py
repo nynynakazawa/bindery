@@ -48,6 +48,11 @@ from .search import count_outside_scope, search
 from .store import Store
 from .tokens import estimate_tokens
 
+#: How many recently-shown paths to remember per session, for turning a later
+#: read into a confirmed use. Large enough to span a few searches, small enough
+#: that a long session cannot grow without bound.
+OFFERED_MEMORY = 200
+
 
 
 class MemoryServer:
@@ -68,6 +73,10 @@ class MemoryServer:
         self.client_name = ""
         self._finalized = False
         self._lock = threading.RLock()
+        #: Paths this session has shown in search results. Reading one of them
+        #: is what turns an impression into evidence that it was useful.
+        #: Bounded because a long session must not accumulate without limit.
+        self._offered: dict[str, None] = {}
 
     def _index_written(self, rel: str) -> None:
         """Bring the index up to date for the one note that just changed.
@@ -138,8 +147,16 @@ class MemoryServer:
             lines.append(f"--- {location}{origin}  [{hit.matched_by}]")
             lines.append(hit.chunk.body)
             lines.append("")
+        self._remember_offered(hit.chunk.path for hit in hits)
         tail = "" if widened else self._widen_hint(query, scope)
         return "\n".join(lines).rstrip() + tail
+
+    def _remember_offered(self, paths) -> None:
+        for path in paths:
+            self._offered.pop(path, None)
+            self._offered[path] = None
+        while len(self._offered) > OFFERED_MEMORY:
+            self._offered.pop(next(iter(self._offered)))
 
     def _scope_label(self, scope: str) -> str:
         if scope == "all" or not self.config.project:
@@ -178,6 +195,12 @@ class MemoryServer:
             return f"Refused: {rel!r} is outside the configured index boundary."
         if not target.exists():
             return f"Not found: {rel}"
+        if self._offered.pop(rel, "missing") is None:
+            # Followed a search result through to the note. That is the one
+            # thing this server can observe that distinguishes "we showed it"
+            # from "it helped", so it is the only signal that trains ranking.
+            self.store.record_use([rel])
+            self.store.commit()
         text = target.read_text(encoding="utf-8")
         cap = args.get("max_tokens") or self.config.max_tokens
         if estimate_tokens(text) <= cap:
@@ -314,14 +337,21 @@ class MemoryServer:
         duplicates = find_duplicates(self.store)
         stale = stale_notes(self.store)
         promote = promotion_candidates(self.store)
+        unread = self.store.shown_but_unread()
 
         report: dict[str, Any] = {
             "knowledge_gaps": [
                 {"query": g.query, "asked": g.count} for g in gaps
             ],
             "load_bearing_notes": [
-                {"path": path, "retrievals": uses, "weight": round(score, 3)}
+                {"path": path, "times_read": uses, "weight": round(score, 3)}
                 for path, uses, score in hot
+            ],
+            # Shown often, never opened. Either the passage answers the
+            # question on its own, or the note keeps matching queries it has
+            # nothing to say about - worth a human eye either way.
+            "shown_but_never_read": [
+                {"path": path, "times_shown": shown} for path, shown in unread
             ],
             "near_duplicate_total": len(duplicates),
             "near_duplicates": [
@@ -349,6 +379,11 @@ class MemoryServer:
         if promote:
             advice.append(
                 f"{len(promote)} journal topic(s) recur often enough to deserve their own note."
+            )
+        if unread:
+            advice.append(
+                f"{len(unread)} note(s) keep appearing in results but are never read - "
+                "check whether they match queries they cannot answer."
             )
         if not advice:
             advice.append("Nothing needs attention.")

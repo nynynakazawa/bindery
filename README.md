@@ -5,11 +5,11 @@
 [日本語版 README](README.ja.md)
 
 Bindery is an [MCP](https://modelcontextprotocol.io) server that gives your
-coding agents a single, persistent knowledge base that **gets better as you use
-it**. Claude Code writes a decision down; Codex finds it in the next session.
-Retrieval learns from itself, so the notes that keep answering questions rise and
-the ones that stopped mattering fade. Your notes stay as plain Markdown on disk,
-so Obsidian, `grep`, and `git` all keep working.
+coding agents a single, persistent knowledge base, **scoped to the project
+you are in**. Claude Code writes a decision down; Codex finds it in the next
+session. Notes that agents actually read get ranked higher and ones that stop
+being read fade, so the memory sharpens with use. Your notes stay as plain
+Markdown on disk, so Obsidian, `grep`, and `git` all keep working.
 
 ---
 
@@ -54,10 +54,17 @@ passages under a hard token budget, from an index both agents share.
   because trigram cannot represent them.
 - **Obsidian-compatible.** `[[wiki links]]` become a navigable graph. The vault
   is only ever read and written as Markdown files.
-- **It grows on its own.** Every search is a training signal. Notes that answer
-  questions get ranked higher; notes that stopped being useful decay back down;
-  questions that returned nothing are logged as knowledge gaps in the agents' own
-  words. No model calls, no configuration, no curation required.
+- **It grows on its own.** Reading a search result is treated as evidence that
+  it helped, and that reranks future results; notes that stop being read decay
+  back down; questions that returned nothing are logged as knowledge gaps in the
+  agents' own words. No model calls, no configuration, no curation required.
+- **Project-scoped by default.** A decision made in one repository is not an
+  answer about another. Searches cover the current project plus notes marked as
+  applying everywhere, widening on request - or automatically, when the project
+  has nothing to say.
+- **You choose what is indexed.** Point it at an existing Obsidian vault and
+  `--include` the directories that belong to work. Everything indexed can reach
+  the model; nothing outside the boundary is read.
 - **Journal, then graduate.** `memory_learn` appends what an agent learned to a
   daily journal. When a topic recurs across enough days, it is surfaced as ready
   to become a durable note of its own.
@@ -335,12 +342,20 @@ the index open at once.
                                             stale notes, promotions
 ```
 
-**Usage is the training signal, and it is free.** Each search records the query
-and the notes that answered it. A note's weight is `log(frequency)` times an
-exponential recency decay with a 30-day half-life, so heavy use cannot let one
-note dominate and knowledge that stopped being useful quietly stops being
-boosted. The boost is capped at 25%: history may break ties, but it must never
-outrank an actual content match.
+**Being read is the signal - being shown is not.** This distinction is the
+whole design. Counting "appeared in results" as usefulness is a loop with no
+ground truth in it: a note ranks third, so it is shown, so it scores, so it
+ranks higher, so it is shown more. Whether it ever answered anything never
+enters into it. So appearing in results is recorded as an *impression*, which
+changes no ranking, and only an agent following a result through to
+`memory_read` counts as use. `memory_review` reports notes that are shown
+constantly and never opened, which the old loop would have promoted instead of
+flagged.
+
+To be plain about what this is: a note's weight is `log(reads)` times an
+exponential recency decay with a 30-day half-life, and the boost is capped at
+25%. That is popularity-and-recency reranking on a confirmed signal, not a
+learned model. History may break ties; it must never outrank a content match.
 
 **Usage is keyed by note path, not chunk id.** Chunk ids are rebuilt on every
 reindex; keying on them would erase everything the system had learned each time

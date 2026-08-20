@@ -236,7 +236,10 @@ def search(
 
     if learn:
         store.record_query(query, len(hits))
-        store.record_use(sorted({hit.chunk.path for hit in hits}))
+        # Shown, not used. What raises a note's ranking is an agent going on to
+        # read it (see Store.record_use) - being returned is a statement about
+        # the current ranking, and feeding it back in only confirms itself.
+        store.record_impressions(sorted({hit.chunk.path for hit in hits}))
         store.commit()
 
     return hits, {

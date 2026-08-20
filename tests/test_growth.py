@@ -95,16 +95,41 @@ def test_answered_queries_are_not_gaps(config, indexed):
     assert [g for g in knowledge_gaps(store) if g.query == "alpha"] == []
 
 
-def test_retrieval_history_identifies_load_bearing_notes(config, indexed):
+def test_being_shown_does_not_make_a_note_load_bearing(config, indexed):
+    """Otherwise ranking trains on its own output and never on an outcome."""
     (config.vault / "used.md").write_text("# Used\n\nsignalword here\n", encoding="utf-8")
-    (config.vault / "ignored.md").write_text("# Ignored\n\nsomething else\n", encoding="utf-8")
     store = indexed()
     for _ in range(4):
         search(config, store, "signalword")
 
-    hot = hot_paths(store)
+    assert hot_paths(store) == []
+    assert store.shown_but_unread(minimum=4) == [("used.md", 4)]
+
+
+def test_reading_a_result_is_what_makes_a_note_load_bearing(config):
+    """Following a result through to the note is the closest thing to proof."""
+    (config.vault / "used.md").write_text("# Used\n\nsignalword here\n", encoding="utf-8")
+    (config.vault / "ignored.md").write_text("# Ignored\n\nsignalword also\n", encoding="utf-8")
+    server = MemoryServer(config)
+
+    for _ in range(4):
+        _call(server, "memory_search", {"query": "signalword"})
+        _call(server, "memory_read", {"path": "used.md"})
+
+    hot = hot_paths(server.store)
     assert hot and hot[0][0] == "used.md"
     assert "ignored.md" not in {path for path, _, _ in hot}
+
+
+def test_reading_a_note_nobody_offered_is_not_a_vote(config):
+    """Only a read that followed a search result counts - otherwise any
+    memory_read on a guessed path would train the ranking."""
+    (config.vault / "used.md").write_text("# Used\n\nsignalword here\n", encoding="utf-8")
+    server = MemoryServer(config)
+
+    _call(server, "memory_read", {"path": "used.md"})
+
+    assert hot_paths(server.store) == []
 
 
 def test_learning_can_be_switched_off(config, indexed):
@@ -289,7 +314,9 @@ def test_growth_is_shared_between_agents(config):
     claude_side = MemoryServer(config)
     _call(claude_side, "memory_learn", {"content": "デプロイは同一成果物を昇格させる。", "tags": ["deploy"]})
     for _ in range(4):
-        _call(claude_side, "memory_search", {"query": "デプロイ"})
+        text, _ = _call(claude_side, "memory_search", {"query": "デプロイ"})
+        path = text.split("--- ", 1)[1].split(" ", 1)[0]
+        _call(claude_side, "memory_read", {"path": path})
 
     codex_side = MemoryServer(
         Config.resolve(vault=config.vault, state_dir=config.state_dir, semantic=False)

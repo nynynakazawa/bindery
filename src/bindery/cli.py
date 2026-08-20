@@ -226,7 +226,9 @@ def cmd_review(args: argparse.Namespace) -> int:
     section("knowledge gaps (asked, never answered)", gaps,
             lambda g: f"{g.count}x  {g.query}")
     section("load-bearing notes", hot,
-            lambda r: f"{r[1]:>4} retrievals  weight {r[2]:.2f}  {r[0]}")
+            lambda r: f"{r[1]:>4} reads  weight {r[2]:.2f}  {r[0]}")
+    section("shown but never read", store.shown_but_unread(),
+            lambda r: f"{r[1]:>4} times shown  {r[0]}")
     section("near-duplicates", duplicates[:10],
             lambda d: f"{d.similarity:.2f}  {d.left}  <->  {d.right}",
             total=len(duplicates))
