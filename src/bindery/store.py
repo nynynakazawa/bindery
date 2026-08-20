@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import struct
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -122,16 +124,62 @@ class Store:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
+        # isolation_level=None turns off the driver's implicit DEFERRED
+        # transactions so that writes can be wrapped in BEGIN IMMEDIATE
+        # instead. The distinction matters with two agents running: a deferred
+        # transaction takes its write lock late, after it has already read, and
+        # if the other process wrote in between there is no way to resolve it -
+        # SQLite returns SQLITE_BUSY immediately and the busy timeout does not
+        # apply, because waiting could only deadlock. IMMEDIATE takes the lock
+        # up front, so the second writer waits its turn and then proceeds.
+        self.conn = sqlite3.connect(db_path, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         # WAL plus a busy timeout is what lets Claude Code and Codex hold the
         # same index open at once without either of them erroring out.
-        self.conn.execute("PRAGMA busy_timeout=5000")
+        self.conn.execute("PRAGMA busy_timeout=15000")
+        self._depth = 0
+        # Outside a transaction on purpose: sqlite3.executescript() issues an
+        # implicit COMMIT before it runs, which would silently close one we
+        # had opened. Every statement is CREATE ... IF NOT EXISTS, so two
+        # processes starting at once resolve through the busy timeout.
         self.conn.executescript(_SCHEMA)
-        self.set_meta("schema_version", str(SCHEMA_VERSION))
-        self.conn.commit()
+        with self.write():
+            self.set_meta("schema_version", str(SCHEMA_VERSION))
+
+    # -------------------------------------------------------- transactions
+
+    @contextmanager
+    def write(self) -> Iterator[None]:
+        """Run a write as one serialised, all-or-nothing transaction.
+
+        Re-entrant, so a caller that already opened a transaction can call
+        methods that would otherwise open their own without nesting BEGINs -
+        SQLite has no nested transactions, and the inner COMMIT would publish
+        the outer one's half-finished work.
+
+        Scope is deliberately one note rather than a whole reindex: the write
+        lock is exclusive, and holding it for an entire vault scan would stall
+        the other agent for as long as the scan takes.
+        """
+        if self._depth:
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        self._depth = 1
+        try:
+            yield
+        except BaseException:
+            self._depth = 0
+            self.conn.execute("ROLLBACK")
+            raise
+        self._depth = 0
+        self.conn.execute("COMMIT")
 
     # ---------------------------------------------------------------- meta
 
@@ -156,11 +204,12 @@ class Store:
         return {r["path"] for r in self.conn.execute("SELECT path FROM notes")}
 
     def delete_note(self, path: str) -> None:
-        row = self.conn.execute("SELECT id FROM notes WHERE path=?", (path,)).fetchone()
-        if row is None:
-            return
-        self._drop_chunk_rows(row["id"])
-        self.conn.execute("DELETE FROM notes WHERE id=?", (row["id"],))
+        with self.write():
+            row = self.conn.execute("SELECT id FROM notes WHERE path=?", (path,)).fetchone()
+            if row is None:
+                return
+            self._drop_chunk_rows(row["id"])
+            self.conn.execute("DELETE FROM notes WHERE id=?", (row["id"],))
 
     def _drop_chunk_rows(self, note_id: int) -> None:
         """Remove a note's chunks, keeping the external FTS table in step.
@@ -186,6 +235,23 @@ class Store:
         links: list[str],
     ) -> int:
         """Replace a note and all of its derived rows atomically."""
+        with self.write():
+            return self._upsert_note_locked(
+                path=path, title=title, tags=tags, mtime=mtime,
+                digest=digest, chunks=chunks, links=links,
+            )
+
+    def _upsert_note_locked(
+        self,
+        *,
+        path: str,
+        title: str,
+        tags: list[str],
+        mtime: float,
+        digest: str,
+        chunks: list[tuple[str, str, int]],
+        links: list[str],
+    ) -> int:
         self.delete_note(path)
         cur = self.conn.execute(
             "INSERT INTO notes(path, title, tags, mtime, digest) VALUES(?,?,?,?,?)",
@@ -263,22 +329,24 @@ class Store:
     def record_query(self, text: str, hits: int, agent: str = "") -> None:
         import time
 
-        self.conn.execute(
-            "INSERT INTO queries(text, ts, hits, agent) VALUES(?,?,?,?)",
-            (text, time.time(), hits, agent),
-        )
+        with self.write():
+            self.conn.execute(
+                "INSERT INTO queries(text, ts, hits, agent) VALUES(?,?,?,?)",
+                (text, time.time(), hits, agent),
+            )
 
     def record_use(self, paths: list[str]) -> None:
         """Count a retrieval against every note that supplied a passage."""
         import time
 
         now = time.time()
-        for path in paths:
-            self.conn.execute(
-                "INSERT INTO usage(path, uses, last_used) VALUES(?,1,?) "
-                "ON CONFLICT(path) DO UPDATE SET uses = uses + 1, last_used = ?",
-                (path, now, now),
-            )
+        with self.write():
+            for path in paths:
+                self.conn.execute(
+                    "INSERT INTO usage(path, uses, last_used) VALUES(?,1,?) "
+                    "ON CONFLICT(path) DO UPDATE SET uses = uses + 1, last_used = ?",
+                    (path, now, now),
+                )
 
     def usage_map(self) -> dict[str, tuple[int, float, int]]:
         return {
@@ -287,28 +355,34 @@ class Store:
         }
 
     def set_pinned(self, path: str, pinned: bool) -> None:
-        self.conn.execute(
-            "INSERT INTO usage(path, uses, last_used, pinned) VALUES(?,0,0,?) "
-            "ON CONFLICT(path) DO UPDATE SET pinned=excluded.pinned",
-            (path, int(pinned)),
-        )
+        with self.write():
+            self.conn.execute(
+                "INSERT INTO usage(path, uses, last_used, pinned) VALUES(?,0,0,?) "
+                "ON CONFLICT(path) DO UPDATE SET pinned=excluded.pinned",
+                (path, int(pinned)),
+            )
 
     def prune_queries(self, keep: int = 5000) -> int:
         """Cap the telemetry table so it cannot grow without bound."""
-        row = self.conn.execute("SELECT COUNT(*) FROM queries").fetchone()
-        total = int(row[0])
-        if total <= keep:
-            return 0
-        self.conn.execute(
-            "DELETE FROM queries WHERE id NOT IN "
-            "(SELECT id FROM queries ORDER BY ts DESC LIMIT ?)",
-            (keep,),
-        )
+        with self.write():
+            row = self.conn.execute("SELECT COUNT(*) FROM queries").fetchone()
+            total = int(row[0])
+            if total <= keep:
+                return 0
+            self.conn.execute(
+                "DELETE FROM queries WHERE id NOT IN "
+                "(SELECT id FROM queries ORDER BY ts DESC LIMIT ?)",
+                (keep,),
+            )
         return total - keep
 
     def commit(self) -> None:
-        self.conn.commit()
+        """Retained for callers; writes already committed themselves.
+
+        Every mutating method wraps itself in :meth:`write`, so there is never
+        an open transaction to flush here. Kept as a no-op rather than removed
+        because "commit at the end" is what callers reasonably expect to exist.
+        """
 
     def close(self) -> None:
-        self.conn.commit()
         self.conn.close()

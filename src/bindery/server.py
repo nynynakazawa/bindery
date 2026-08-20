@@ -31,6 +31,7 @@ from .growth import (
     stale_notes,
 )
 from .indexer import reindex
+from .safeio import update_text
 from .search import search
 from .store import Store
 from .tokens import estimate_tokens
@@ -246,7 +247,10 @@ class MemoryServer:
             front.append("---")
             front.append("")
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("\n".join([*front, content]).rstrip() + "\n", encoding="utf-8")
+        body = "\n".join([*front, content]).rstrip() + "\n"
+        # Locked even though this is a whole-file replace, so that it cannot
+        # land in the middle of a concurrent read-modify-write of the same note.
+        update_text(target, lambda _current: body, lock_dir=self.config.state_dir)
 
         reindex(self.config, self.store)
         if args.get("pin"):
@@ -278,32 +282,42 @@ class MemoryServer:
             return "Refused: journal path resolved outside the vault."
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        existing_tags: list[str] = []
-        entries = ""
-        if target.exists():
+        stamp = datetime.datetime.now().strftime("%H:%M")
+
+        def append_entry(current: str) -> str:
+            """Merge one entry into whatever is on disk *right now*.
+
+            Runs under the journal's lock, so `current` is the version written
+            by any agent that got here first - which is exactly what makes a
+            concurrent entry an addition rather than an overwrite.
+            """
             from .indexer import parse_frontmatter
 
-            meta, entries = parse_frontmatter(target.read_text(encoding="utf-8"))
-            existing_tags = [t for t in meta.get("tags", "").strip("[]").split(",") if t.strip()]
-            existing_tags = [t.strip() for t in existing_tags]
+            existing_tags: list[str] = []
+            entries = ""
+            if current:
+                meta, entries = parse_frontmatter(current)
+                existing_tags = [
+                    t.strip()
+                    for t in meta.get("tags", "").strip("[]").split(",")
+                    if t.strip()
+                ]
 
-        merged = sorted({*existing_tags, *tags})
-        stamp = datetime.datetime.now().strftime("%H:%M")
-        header = ["---", f"title: Journal {today}"]
-        if merged:
-            header.append("tags: [" + ", ".join(merged) + "]")
-        header += ["---", ""]
+            merged = sorted({*existing_tags, *tags})
+            header = ["---", f"title: Journal {today}"]
+            if merged:
+                header.append("tags: [" + ", ".join(merged) + "]")
+            header += ["---", ""]
 
-        body = entries.rstrip()
-        if not body:
-            body = f"# Journal {today}"
-        entry_tags = " ".join(f"#{t}" for t in tags)
-        body += f"\n\n## {stamp}\n\n{content}"
-        if entry_tags:
-            body += f"\n\n{entry_tags}"
+            body = entries.rstrip() or f"# Journal {today}"
+            body += f"\n\n## {stamp}\n\n{content}"
+            entry_tags = " ".join(f"#{t}" for t in tags)
+            if entry_tags:
+                body += f"\n\n{entry_tags}"
+            # header already ends in a blank line; body starts at the H1.
+            return "\n".join(header) + body.lstrip("\n") + "\n"
 
-        target.write_text("\n".join(header) + body.lstrip("\n") + "\n", encoding="utf-8")
-        # header already ends in a blank line; body starts at the H1.
+        update_text(target, append_entry, lock_dir=self.config.state_dir)
         reindex(self.config, self.store)
         self.session.learned += 1
         return f"Recorded in {rel} (~{estimate_tokens(content)} tokens)." + (
@@ -451,16 +465,21 @@ class MemoryServer:
             return None
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        existing = ""
-        if target.exists():
+        today = datetime.date.today().isoformat()
+        rendered = self.session.render(client=self.client_name)
+
+        def append_record(current: str) -> str:
             from .indexer import parse_frontmatter
 
-            _, existing = parse_frontmatter(target.read_text(encoding="utf-8"))
-        today = datetime.date.today().isoformat()
-        header = "---\ntitle: Sessions {0}\n---\n\n".format(today)
-        body = existing.rstrip() or f"# Sessions {today}"
-        body += "\n\n" + self.session.render(client=self.client_name)
-        target.write_text(header + body.lstrip("\n") + "\n", encoding="utf-8")
+            existing = ""
+            if current:
+                _, existing = parse_frontmatter(current)
+            header = "---\ntitle: Sessions {0}\n---\n\n".format(today)
+            body = existing.rstrip() or f"# Sessions {today}"
+            body += "\n\n" + rendered
+            return header + body.lstrip("\n") + "\n"
+
+        update_text(target, append_record, lock_dir=self.config.state_dir)
 
         try:
             reindex(self.config, self.store)
