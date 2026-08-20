@@ -142,7 +142,7 @@ class MemoryServer:
             lines.append(f"({meta['truncated']} further match(es) omitted to stay inside the budget.)")
         lines.append("")
         for hit in hits:
-            location = f"{hit.chunk.path}" + (f" # {hit.chunk.heading}" if hit.chunk.heading else "")
+            location = f"{hit.chunk.path}" + (f" # {hit.chunk.breadcrumb}" if hit.chunk.breadcrumb else "")
             origin = f"  [{hit.chunk.project}]" if hit.chunk.project else "  [global]"
             lines.append(f"--- {location}{origin}  [{hit.matched_by}]")
             lines.append(hit.chunk.body)

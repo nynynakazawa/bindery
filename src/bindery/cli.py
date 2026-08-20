@@ -124,7 +124,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 "hits": [
                     {
                         "path": h.chunk.path,
-                        "heading": h.chunk.heading,
+                        "heading": h.chunk.breadcrumb,
                         "tokens": h.chunk.tokens,
                         "matched_by": h.matched_by,
                         "body": h.chunk.body,
@@ -139,7 +139,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"{meta['returned']} passage(s), ~{meta['tokens']} tokens "
               f"({meta['truncated']} dropped by budget)\n")
         for hit in hits:
-            where = hit.chunk.path + (f" # {hit.chunk.heading}" if hit.chunk.heading else "")
+            where = hit.chunk.path + (f" # {hit.chunk.breadcrumb}" if hit.chunk.breadcrumb else "")
             print(f"--- {where}  [{hit.matched_by}]")
             print(hit.chunk.body)
             print()

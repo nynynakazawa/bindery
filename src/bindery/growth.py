@@ -241,7 +241,7 @@ def find_duplicates(store: Store, *, threshold: float = DUPLICATE_THRESHOLD) -> 
     exactly.
     """
     rows = store.conn.execute(
-        "SELECT c.id, c.heading, c.body, n.path FROM chunks c JOIN notes n ON n.id = c.note_id"
+        "SELECT c.id, c.breadcrumb, c.body, n.path FROM chunks c JOIN notes n ON n.id = c.note_id"
     ).fetchall()
 
     shingles: dict[int, set[int]] = {}
@@ -254,7 +254,7 @@ def find_duplicates(store: Store, *, threshold: float = DUPLICATE_THRESHOLD) -> 
         if len(sketch) < MIN_SHINGLES_FOR_DUPLICATE:
             continue
         shingles[chunk_id] = sketch
-        meta[chunk_id] = (row["path"], row["heading"])
+        meta[chunk_id] = (row["path"], row["breadcrumb"])
         # Inverted index over sketch values: two passages that overlap heavily
         # necessarily share sketch values, so any shared value makes them
         # candidates and exact containment decides.

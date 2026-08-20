@@ -153,35 +153,116 @@ def parse_note(path: Path, text: str) -> ParsedNote:
     )
 
 
+#: Opens or closes a fenced code block. Backticks or tildes, three or more.
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+#: A table row, or the ---|--- separator under a header row.
+TABLE_RE = re.compile(r"^\s*\|.*\|\s*$|^\s*\|?[\s:-]*-{2,}[\s:|-]*$")
+
+#: A list item, including its continuation lines when indented.
+LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def _atomic_runs(lines: list[str]) -> list[list[str]]:
+    """Group lines into pieces that must not be split apart.
+
+    Splitting on a line boundary is fine in prose and destructive in
+    structure: half a code fence is not code, half a table is not a table, and
+    a list item cut from its bullet loses what it was a list of. Each run is
+    either one such structure or a single ordinary line.
+    """
+    runs: list[list[str]] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        fence = FENCE_RE.match(line)
+        if fence:
+            marker = fence.group(1)[0]
+            run = [line]
+            index += 1
+            while index < len(lines):
+                run.append(lines[index])
+                closing = FENCE_RE.match(lines[index])
+                index += 1
+                if closing and closing.group(1)[0] == marker:
+                    break
+            runs.append(run)
+            continue
+        if TABLE_RE.match(line):
+            run = []
+            while index < len(lines) and TABLE_RE.match(lines[index]):
+                run.append(lines[index])
+                index += 1
+            runs.append(run)
+            continue
+        if LIST_RE.match(line):
+            run = [line]
+            index += 1
+            # Continuation lines are indented, or blank between items.
+            while index < len(lines) and (
+                LIST_RE.match(lines[index])
+                or (lines[index].startswith((" ", "\t")) and lines[index].strip())
+            ):
+                run.append(lines[index])
+                index += 1
+            runs.append(run)
+            continue
+        runs.append([line])
+        index += 1
+    return runs
+
+
+def _breadcrumb(stack: list[tuple[int, str]]) -> str:
+    """``Auth / Backend / Refresh token`` for the current heading stack.
+
+    A chunk labelled only "Refresh token" has lost the thing it is a refresh
+    token *for*. The trail is what makes a deep section legible on its own,
+    both to the ranking and to whoever reads the passage.
+    """
+    return " / ".join(title for _level, title in stack if title)
+
+
 def chunk_markdown(body: str, *, max_tokens: int, overlap: int) -> list[tuple[str, str, int]]:
-    """Split ``body`` into ``(heading, text, tokens)`` passages.
+    """Split ``body`` into ``(breadcrumb, text, tokens)`` passages.
 
     Sections are cut at Markdown headings first, because a heading is the
     author's own statement about where one idea ends and the next begins.
-    Oversized sections are then split by line with a small overlap so that a
-    fact sitting on a boundary is still retrievable.
+    Oversized sections are split further, but only between structures - never
+    through a code block, a table, or a list item.
     """
     sections: list[tuple[str, list[str]]] = []
-    current_heading = ""
+    stack: list[tuple[int, str]] = []
     current: list[str] = []
+    in_fence = ""
     for line in body.splitlines():
-        match = HEADING_RE.match(line)
+        fence = FENCE_RE.match(line)
+        if fence:
+            marker = fence.group(1)[0]
+            if not in_fence:
+                in_fence = marker
+            elif marker == in_fence:
+                in_fence = ""
+        # A "# comment" inside a shell block is not a heading.
+        match = None if in_fence else HEADING_RE.match(line)
         if match:
             if current:
-                sections.append((current_heading, current))
-            current_heading = match.group(2).strip()
+                sections.append((_breadcrumb(stack), current))
+            level = len(match.group(1))
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, match.group(2).strip()))
             current = []
         else:
             current.append(line)
     if current:
-        sections.append((current_heading, current))
+        sections.append((_breadcrumb(stack), current))
 
     chunks: list[tuple[str, str, int]] = []
     for heading, lines in sections:
         buffer: list[str] = []
         used = 0
-        for line in lines:
-            cost = estimate_tokens(line)
+        for run in _atomic_runs(lines):
+            cost = sum(estimate_tokens(line) for line in run)
             if buffer and used + cost > max_tokens:
                 text = "\n".join(buffer).strip()
                 if text:
@@ -194,10 +275,10 @@ def chunk_markdown(body: str, *, max_tokens: int, overlap: int) -> list[tuple[st
                         break
                     tail.insert(0, previous)
                     kept += previous_cost
-                buffer = [*tail, line]
+                buffer = [*tail, *run]
                 used = kept + cost
             else:
-                buffer.append(line)
+                buffer.extend(run)
                 used += cost
         text = "\n".join(buffer).strip()
         if text:
@@ -286,7 +367,7 @@ def refresh_embeddings(config: Config, store: Store, chunk_ids: list[int] | None
     batch_size = 32
     for start in range(0, len(rows), batch_size):
         batch = rows[start : start + batch_size]
-        texts = [f"{r['heading']}\n{r['body']}".strip() for r in batch]
+        texts = [f"{r['breadcrumb']}\n{r['body']}".strip() for r in batch]
         try:
             vectors = backend.encode(texts)
         except Exception:

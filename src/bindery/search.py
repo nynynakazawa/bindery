@@ -50,6 +50,57 @@ class Hit:
 #: two-character words - 認証, 設計, 課金 - so those queries need another path.
 TRIGRAM_MIN = 3
 
+#: Scripts written without spaces between words. A query in these is one
+#: "term" as far as whitespace splitting is concerned, however many ideas it
+#: contains.
+_CJK_RANGES = (
+    (0x3040, 0x30FF),   # hiragana, katakana
+    (0x3400, 0x4DBF),   # CJK extension A
+    (0x4E00, 0x9FFF),   # CJK unified ideographs
+    (0xF900, 0xFAFF),   # compatibility ideographs
+)
+
+#: A CJK term longer than this is treated as a phrase to be broken up rather
+#: than a word to be matched whole.
+CJK_PHRASE_MIN = 5
+
+#: Window size for that decomposition. Four characters is long enough to carry
+#: meaning in Japanese - 認証方式, 実行時依存 - and short enough that a term the
+#: note phrases slightly differently still overlaps somewhere.
+CJK_WINDOW = 4
+
+
+def _is_cjk(text: str) -> bool:
+    return any(
+        any(low <= ord(ch) <= high for low, high in _CJK_RANGES)
+        for ch in text
+    )
+
+
+def _windows(term: str) -> list[str]:
+    """Overlapping slices of a space-free CJK phrase, longest first.
+
+    Without a morphological analyser there is no way to know where the words
+    are, and the trigram index can only match a query as one contiguous
+    substring. So `依存を増やさない理由` matched nothing while
+    `依存を増やさない` matched the answer: one extra word, and a phrase that is
+    present in the note stops being findable.
+
+    Sliding a window over it gives back the substrings that *are* present.
+    They are ORed, so BM25 weighs how many of them a passage contains, and a
+    common window like `について` carries almost no weight because it appears
+    everywhere.
+    """
+    if len(term) < CJK_PHRASE_MIN or not _is_cjk(term):
+        return [term]
+    slices = [term]
+    for start in range(0, len(term) - CJK_WINDOW + 1, 2):
+        slices.append(term[start : start + CJK_WINDOW])
+    tail = term[-CJK_WINDOW:]
+    if tail not in slices:
+        slices.append(tail)
+    return slices
+
 
 def _split_terms(raw: str) -> tuple[list[str], list[str]]:
     """Split a query into ``(trigram_terms, short_terms)``."""
@@ -80,26 +131,37 @@ def _like_ranking(
     """Substring fallback for terms too short for the trigram index.
 
     This is a table scan, which is acceptable at the scale of a personal note
-    collection and is strictly better than returning nothing. Results are
-    ordered by chunk size so that a short, focused passage outranks a long one
-    that merely happens to contain the term.
+    collection and is strictly better than returning nothing.
+
+    Ranking used to be chunk length alone, which is only a tiebreaker dressed
+    up as a ranking: for 認証 it put a two-line note reading "認証済み。" above
+    the actual design document, because the note was shorter. How many of the
+    query's terms a passage contains comes first now, then where they appear -
+    title and breadcrumb beat body - and length only separates what is left.
     """
     if not terms:
         return []
-    body_clauses = ["chunks.body LIKE ? ESCAPE '\\'" for _ in terms]
-    heading_clauses = ["chunks.heading LIKE ? ESCAPE '\\'" for _ in terms]
-    where = " OR ".join(body_clauses + heading_clauses)
+    escaped = [
+        f"%{term.replace(chr(92), chr(92) * 2).replace('%', chr(92) + '%').replace('_', chr(92) + '_')}%"
+        for term in terms
+    ]
+    # One point per term found anywhere, plus a bonus for a strong field.
+    score_parts = []
     params: list[str] = []
-    for term in terms:
-        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params.append(f"%{escaped}%")
-    params = params + list(params)
+    for pattern in escaped:
+        score_parts.append(
+            "(CASE WHEN chunks.body LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END) + "
+            "(CASE WHEN chunks.breadcrumb LIKE ? ESCAPE '\\' THEN 2 ELSE 0 END) + "
+            "(CASE WHEN notes.title LIKE ? ESCAPE '\\' THEN 3 ELSE 0 END)"
+        )
+        params.extend([pattern, pattern, pattern])
+    score = " + ".join(score_parts)
     try:
         rows = store.conn.execute(
-            f"""SELECT chunks.id FROM chunks
+            f"""SELECT chunks.id, ({score}) AS score FROM chunks
                 JOIN notes ON notes.id = chunks.note_id
-                WHERE ({where}) {scope_sql}
-                ORDER BY chunks.tokens ASC LIMIT ?""",
+                WHERE score > 0 {scope_sql}
+                ORDER BY score DESC, chunks.tokens ASC LIMIT ?""",
             [*params, *(scope_params or []), depth],
         ).fetchall()
     except Exception:
@@ -107,33 +169,76 @@ def _like_ranking(
     return [int(r["id"]) for r in rows]
 
 
-def _keyword_ranking(
-    store: Store, query: str, depth: int, scope_sql: str = "", scope_params: list | None = None
-) -> list[int]:
-    long_terms, short_terms = _split_terms(query)
-    ranked: list[int] = []
+#: BM25 column weights, in schema order: title, tags, breadcrumb, body.
+#: A hit in the note's title is a much stronger statement about what the note
+#: is about than the same word buried in a paragraph.
+_BM25_WEIGHTS = (4.0, 3.0, 2.0, 1.0)
 
-    expression = " OR ".join(f'"{t}"' for t in long_terms)
-    if expression:
-        try:
-            rows = store.conn.execute(
-                f"""SELECT chunks_fts.rowid AS rowid FROM chunks_fts
-                    JOIN chunks ON chunks.id = chunks_fts.rowid
-                    JOIN notes ON notes.id = chunks.note_id
-                    WHERE chunks_fts MATCH ? {scope_sql}
-                    ORDER BY bm25(chunks_fts, 2.0, 1.0) LIMIT ?""",
-                (expression, *(scope_params or []), depth),
-            ).fetchall()
-            ranked.extend(int(r["rowid"]) for r in rows)
-        except Exception:
-            pass
+
+def _fts_match(
+    store: Store, expression: str, depth: int, scope_sql: str, scope_params: list | None
+) -> list[int]:
+    if not expression:
+        return []
+    weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
+    try:
+        rows = store.conn.execute(
+            f"""SELECT chunks_fts.rowid AS rowid FROM chunks_fts
+                JOIN chunks ON chunks.id = chunks_fts.rowid
+                JOIN notes ON notes.id = chunks.note_id
+                WHERE chunks_fts MATCH ? {scope_sql}
+                ORDER BY bm25(chunks_fts, {weights}) LIMIT ?""",
+            (expression, *(scope_params or []), depth),
+        ).fetchall()
+    except Exception:
+        return []
+    return [int(r["rowid"]) for r in rows]
+
+
+def _keyword_rankings(
+    store: Store, query: str, depth: int, scope_sql: str = "", scope_params: list | None = None
+) -> dict[str, list[int]]:
+    """Two keyword rankings, strict and loose, to be fused rather than chosen.
+
+    OR alone was too blunt: `認証 設計 Firebase` matched any passage mentioning
+    Firebase and nothing else, and recall bought with that much noise is not
+    worth having. AND alone is too brittle - one term the note happens not to
+    use and a perfect match disappears, which is how `依存を増やさない理由`
+    found nothing while `依存を増やさない` found the answer.
+
+    Producing both and letting the fusion combine them keeps the property that
+    matters: passages containing every term outrank passages containing some,
+    without passages containing some being dropped.
+    """
+    long_terms, short_terms = _split_terms(query)
+    rankings: dict[str, list[int]] = {}
+
+    quoted = [f'"{t}"' for t in long_terms]
+    if quoted:
+        strict = _fts_match(store, " AND ".join(quoted), depth, scope_sql, scope_params)
+        if strict and len(quoted) > 1:
+            rankings["all-terms"] = strict
+        loose = _fts_match(store, " OR ".join(quoted), depth, scope_sql, scope_params)
+        if loose:
+            rankings["keyword"] = loose
+        if not strict:
+            # Nothing matched the phrases whole. Fall back to their parts,
+            # which is the only way a space-free CJK query survives being one
+            # word longer than the note it is looking for.
+            pieces = [f'"{w}"' for term in long_terms for w in _windows(term)]
+            if len(pieces) > len(quoted):
+                partial = _fts_match(
+                    store, " OR ".join(dict.fromkeys(pieces)), depth, scope_sql, scope_params
+                )
+                if partial:
+                    rankings["partial"] = partial
 
     if short_terms:
-        for chunk_id in _like_ranking(store, short_terms, depth, scope_sql, scope_params):
-            if chunk_id not in ranked:
-                ranked.append(chunk_id)
+        substring = _like_ranking(store, short_terms, depth, scope_sql, scope_params)
+        if substring:
+            rankings["substring"] = substring
 
-    return ranked[:depth]
+    return rankings
 
 
 def _semantic_ranking(
@@ -189,7 +294,7 @@ def search(
     depth = max(limit * 4, 20)
     scope_sql, scope_params = store.scope_clause(scope, config.project)
 
-    rankings = {"keyword": _keyword_ranking(store, query, depth, scope_sql, scope_params)}
+    rankings = _keyword_rankings(store, query, depth, scope_sql, scope_params)
     if config.semantic:
         semantic = _semantic_ranking(store, query, depth, scope_sql, scope_params)
         if semantic:
@@ -260,6 +365,11 @@ def count_outside_scope(config: Config, store: Store, query: str) -> int:
     if not config.project:
         return 0
     depth = 200
-    narrow = set(_keyword_ranking(store, query, depth, *store.scope_clause("project", config.project)))
-    wide = set(_keyword_ranking(store, query, depth))
-    return len(wide - narrow)
+    def flatten(scope: str) -> set[int]:
+        sql, params = store.scope_clause(scope, config.project)
+        found: set[int] = set()
+        for ranking in _keyword_rankings(store, query, depth, sql, params).values():
+            found.update(ranking)
+        return found
+
+    return len(flatten("all") - flatten("project"))

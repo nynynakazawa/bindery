@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -40,15 +40,23 @@ CREATE TABLE IF NOT EXISTS chunks (
     id       INTEGER PRIMARY KEY,
     note_id  INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
     seq      INTEGER NOT NULL,
-    heading  TEXT NOT NULL DEFAULT '',
+    -- Full heading trail, e.g. 'Auth / Backend / Refresh token'.
+    breadcrumb TEXT NOT NULL DEFAULT '',
     body     TEXT NOT NULL,
     tokens   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS chunks_note ON chunks(note_id);
 
 -- Trigram tokenizer: required for CJK substring matching.
+--
+-- Title and tags are indexed alongside the passage because in a personal
+-- knowledge base the note's name is often the most precise statement of what
+-- it is about, and the body may never repeat it. Searching only the body
+-- misses "the note called exactly this".
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-    heading,
+    title,
+    tags,
+    breadcrumb,
     body,
     tokenize='trigram'
 );
@@ -113,7 +121,7 @@ class Chunk:
     note_id: int
     path: str
     title: str
-    heading: str
+    breadcrumb: str
     body: str
     tokens: int
     project: str = ""
@@ -318,7 +326,7 @@ class Store:
             return []
         marks = ",".join("?" * len(chunk_ids))
         return self.conn.execute(
-            f"SELECT c.id, c.heading, c.body FROM chunks c "
+            f"SELECT c.id, c.breadcrumb, c.body FROM chunks c "
             f"LEFT JOIN vectors v ON v.chunk_id = c.id "
             f"WHERE v.chunk_id IS NULL AND c.id IN ({marks})",
             chunk_ids,
@@ -384,15 +392,16 @@ class Store:
             (path, title, json.dumps(tags, ensure_ascii=False), mtime, digest, project),
         )
         note_id = int(cur.lastrowid)
-        for seq, (heading, body, tokens) in enumerate(chunks):
+        for seq, (breadcrumb, body, tokens) in enumerate(chunks):
             cur = self.conn.execute(
-                "INSERT INTO chunks(note_id, seq, heading, body, tokens) VALUES(?,?,?,?,?)",
-                (note_id, seq, heading, body, tokens),
+                "INSERT INTO chunks(note_id, seq, breadcrumb, body, tokens) VALUES(?,?,?,?,?)",
+                (note_id, seq, breadcrumb, body, tokens),
             )
             chunk_id = int(cur.lastrowid)
             self.conn.execute(
-                "INSERT INTO chunks_fts(rowid, heading, body) VALUES(?,?,?)",
-                (chunk_id, heading, body),
+                "INSERT INTO chunks_fts(rowid, title, tags, breadcrumb, body) "
+                "VALUES(?,?,?,?,?)",
+                (chunk_id, title, " ".join(tags), breadcrumb, body),
             )
         for target in links:
             self.conn.execute("INSERT INTO links(src_note_id, target) VALUES(?,?)", (note_id, target))
@@ -425,7 +434,7 @@ class Store:
             return {}
         marks = ",".join("?" * len(chunk_ids))
         rows = self.conn.execute(
-            f"""SELECT c.id, c.note_id, c.heading, c.body, c.tokens,
+            f"""SELECT c.id, c.note_id, c.breadcrumb, c.body, c.tokens,
                        n.path, n.title, n.project
                 FROM chunks c JOIN notes n ON n.id = c.note_id
                 WHERE c.id IN ({marks})""",
@@ -437,7 +446,7 @@ class Store:
                 note_id=r["note_id"],
                 path=r["path"],
                 title=r["title"],
-                heading=r["heading"],
+                breadcrumb=r["breadcrumb"],
                 body=r["body"],
                 tokens=r["tokens"],
                 project=r["project"],
@@ -447,7 +456,7 @@ class Store:
 
     def iter_chunks_without_vectors(self):
         return self.conn.execute(
-            "SELECT c.id, c.heading, c.body FROM chunks c "
+            "SELECT c.id, c.breadcrumb, c.body FROM chunks c "
             "LEFT JOIN vectors v ON v.chunk_id = c.id WHERE v.chunk_id IS NULL"
         ).fetchall()
 
