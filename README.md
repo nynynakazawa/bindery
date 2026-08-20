@@ -146,6 +146,44 @@ bindery status           # confirm
 
 That is the whole installation.
 
+### Choosing what gets indexed
+
+If your vault holds more than work notes - a diary, client material, anything
+personal - draw the boundary before the first index. Everything indexed can come
+back from a search and land in an agent's context, which for a hosted model
+means leaving the machine.
+
+```bash
+bindery setup --write --include projects --include engineering
+```
+
+`--include` is an allowlist: name a directory and nothing outside it is read,
+by search, by `memory_read`, or by anything else. `--exclude` removes a subtree
+from an otherwise whole vault. Both take vault-relative paths and match on path
+segments, so `--exclude private` does not also cover `private-api-notes.md`.
+`bindery status` prints the boundary currently in force.
+
+### Projects
+
+A decision made in one repository is not an answer about another, so notes carry
+the project they belong to and searches default to the current one plus notes
+marked as applying everywhere.
+
+The current project is the git remote of the directory the agent launched the
+server in, so nothing needs configuring in the normal case. `--project NAME`
+overrides it, and `--project ""` turns scoping off entirely.
+
+Notes get their project from front matter if they have it, and from their
+top-level folder otherwise - so a vault already organised one folder per project
+works with no metadata at all. Anything written through `memory_write` or
+`memory_learn` records the project automatically; pass `project=""` for
+knowledge that is true everywhere.
+
+Narrowing never costs you an answer. When the current project has nothing to
+say, the search widens by itself and says so; when it answers but other projects
+also match, the result says how many; and every passage is labelled with where
+it came from.
+
 `setup` previews by default rather than acting, because its last step appends to
 the agent policy files in your home directory - long, hand-maintained files worth
 looking at before something edits them. Existing files are backed up, never
@@ -226,13 +264,13 @@ determines whether anything is ever written down.
 
 | Tool | Purpose |
 | --- | --- |
-| `memory_search` | Search and return matching passages under a token budget. |
+| `memory_search` | Search and return matching passages under a token budget. Takes `scope`: `project` (default), `global`, or `all`. |
 | `memory_read` | Read one note in full, truncated at the budget. |
 | `memory_write` | Create or overwrite a note and index it immediately. |
 | `memory_learn` | Record what this session learned into today's journal. |
 | `memory_review` | Gaps, load-bearing notes, duplicates, stale notes, promotion candidates. |
 | `memory_links` | Outgoing and incoming `[[wiki links]]` for a note. |
-| `memory_status` | Vault path, index size, semantic search state. |
+| `memory_status` | Vault path, index size, current project, index boundary, semantic search state. |
 | `memory_reindex` | Rescan the vault after external edits. |
 
 A prompt that works well in `CLAUDE.md` and `AGENTS.md`:
@@ -280,6 +318,9 @@ turned into clutter.
 | `BINDERY_CHUNK_TOKENS` | `400` | Target passage size. |
 | `BINDERY_SEMANTIC` | on | Set to `0` to force keyword-only. |
 | `BINDERY_AUTOCAPTURE` | on | Set to `0` to stop writing session records. |
+| `BINDERY_INCLUDE` | unset | Comma-separated directories to index, to the exclusion of all others. |
+| `BINDERY_EXCLUDE` | unset | Comma-separated directories never to index. |
+| `BINDERY_PROJECT` | detected | Name of the codebase these searches are about. Empty disables scoping. |
 
 Growth tuning lives in `growth.py` as named constants - `USAGE_HALF_LIFE_DAYS`,
 `USAGE_BOOST_WEIGHT`, `DUPLICATE_THRESHOLD`, `STALE_AFTER_DAYS`,
