@@ -296,3 +296,16 @@ def test_the_environment_boundary_is_honoured_by_the_server(vault, tmp_path, mon
 
     text, _ = _call(server, "memory_search", {"query": "体調", "scope": "all"})
     assert "悪かった" not in text
+
+
+def test_an_indexed_container_directory_is_not_the_project(vault, tmp_path):
+    """`work/alpha` and `work/beta` are two projects, not one called "work"."""
+    _note(vault, "work/alpha/auth.md", "認証は Firebase Auth を使う。")
+    _note(vault, "work/beta/auth.md", "認証は Clerk を使う。")
+
+    server = MemoryServer(_config(vault, tmp_path, project="alpha", include=["work"]))
+    text, _ = _call(server, "memory_search", {"query": "認証"})
+
+    assert "Firebase" in text
+    assert "Clerk" not in text
+    assert "[alpha]" in text

@@ -74,19 +74,30 @@ def is_indexable(rel: str, *, include=(), exclude=()) -> bool:
     return True
 
 
-def project_of(rel: str, meta: dict[str, str] | None = None) -> str:
+def project_of(rel: str, meta: dict[str, str] | None = None, include=()) -> str:
     """Which codebase a note belongs to, or "" for knowledge that spans them.
 
     Front matter wins, because a note can then be moved without changing what
     it is about. The directory is the fallback, which makes the convention of
     one folder per project work with no metadata at all - and a note sitting
     loose at the vault root is genuinely general, so it stays unscoped.
+
+    ``include`` shifts where the search for a project name starts. A vault
+    organised as ``work/alpha/`` and ``work/beta/`` would otherwise report one
+    project called "work", but naming ``work`` as the indexed directory has
+    already said that it is a container rather than a project.
     """
     if meta:
         declared = str(meta.get("project", "")).strip()
         if declared:
             return declared
-    parts = [part for part in rel.replace("\\", "/").split("/") if part]
+    rel = rel.replace("\\", "/")
+    for prefix in sorted(include, key=len, reverse=True):
+        prefix = prefix.replace("\\", "/").strip("/")
+        if prefix and rel.startswith(prefix + "/"):
+            rel = rel[len(prefix) + 1 :]
+            break
+    parts = [part for part in rel.split("/") if part]
     if not parts:
         return ""
     if parts[0] == "journal":
@@ -331,7 +342,7 @@ def _write_note(config: Config, store: Store, path: Path, rel: str, text: str, d
         path=rel,
         title=note.title,
         tags=note.tags,
-        project=project_of(rel, {"project": note.project}),
+        project=project_of(rel, {"project": note.project}, include=config.include),
         mtime=path.stat().st_mtime,
         digest=digest,
         chunks=chunks,
