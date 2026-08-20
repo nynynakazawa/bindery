@@ -326,6 +326,14 @@ def _client_targets(config: Config, scope: str = "user") -> dict[str, dict]:
     command, extra = _server_command()
     args = [*extra, "serve"]
     env = {"BINDERY_VAULT": str(config.vault)}
+    # The boundary has to travel with the configuration. `install --include`
+    # would otherwise apply only to the index built right then: the server the
+    # agent launches would start with no boundary, rescan the whole vault at
+    # startup, and quietly index everything the user had excluded.
+    if config.include:
+        env["BINDERY_INCLUDE"] = ",".join(config.include)
+    if config.exclude:
+        env["BINDERY_EXCLUDE"] = ",".join(config.exclude)
     claude_path = (
         Path.cwd() / ".mcp.json" if scope == "project" else Path.home() / ".claude.json"
     )

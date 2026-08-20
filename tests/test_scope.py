@@ -241,3 +241,58 @@ def test_status_reports_the_boundary_in_force(vault, tmp_path):
 
     assert status["project"] == "alpha"
     assert status["indexed_only"] == ["work"]
+
+
+# ------------------------------------------------- the boundary must persist
+
+
+def test_the_boundary_is_written_into_the_agent_configuration(vault, tmp_path, monkeypatch):
+    """Otherwise it covers the index built at setup time and nothing after it."""
+    import json as _json
+
+    from bindery.cli import main
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    _note(vault, "work/api.md", "body", project="")
+
+    main([
+        "install", "--write", "--vault", str(vault),
+        "--include", "work", "--exclude", "private",
+    ])
+
+    config = _json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    env = config["mcpServers"]["bindery"]["env"]
+    assert env["BINDERY_INCLUDE"] == "work"
+    assert env["BINDERY_EXCLUDE"] == "private"
+
+    codex = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert 'BINDERY_INCLUDE = "work"' in codex
+    assert 'BINDERY_EXCLUDE = "private"' in codex
+
+
+def test_no_boundary_means_no_extra_environment(vault, tmp_path, monkeypatch):
+    """A whole-vault install should not carry empty settings around."""
+    import json as _json
+
+    from bindery.cli import main
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    _note(vault, "work/api.md", "body", project="")
+
+    main(["install", "--write", "--vault", str(vault)])
+
+    config = _json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert set(config["mcpServers"]["bindery"]["env"]) == {"BINDERY_VAULT"}
+
+
+def test_the_environment_boundary_is_honoured_by_the_server(vault, tmp_path, monkeypatch):
+    """The env var the config carries has to actually restrict the index."""
+    _note(vault, "work/api.md", "レート制限は 100rpm。", project="")
+    _note(vault, "日記/2026.md", "今日は体調が悪かった。", project="")
+
+    monkeypatch.setenv("BINDERY_INCLUDE", "work")
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False, project="")
+    server = MemoryServer(config)
+
+    text, _ = _call(server, "memory_search", {"query": "体調", "scope": "all"})
+    assert "悪かった" not in text
