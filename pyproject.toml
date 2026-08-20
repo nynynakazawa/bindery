@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bindery-mcp"
+version = "0.1.0"
+description = "One shared memory for Claude Code and Codex. Markdown stays the source of truth; retrieval is budgeted."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["mcp", "memory", "claude-code", "codex", "obsidian", "rag"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+]
+# No runtime dependencies. The server must start reliably inside two different
+# agent runtimes; every dependency is one more way that can fail in one but not
+# the other.
+dependencies = []
+
+[project.optional-dependencies]
+# Semantic search. Optional because these wheels are large and the keyword
+# index is a complete, working system on its own.
+semantic = ["fastembed>=0.4"]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/nynynakazawa/bindery"
+Repository = "https://github.com/nynynakazawa/bindery"
+Issues = "https://github.com/nynynakazawa/bindery/issues"
+
+[project.scripts]
+bindery = "bindery.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bindery"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,41 @@
+Bindery
+Copyright 2026 nakazawa
+
+This product includes software developed independently by the Bindery
+authors. It is a clean-room implementation.
+
+--------------------------------------------------------------------------
+Design influences and attribution
+--------------------------------------------------------------------------
+
+Bindery was designed after surveying the following projects. Ideas and
+architectural approaches are not subject to copyright; the acknowledgements
+below record intellectual debt, not code reuse.
+
+* Memorix (https://github.com/AVIDS2/memorix) - Apache-2.0
+  Influence: the observation that MCP tool schemas themselves consume context
+  tokens, and the resulting discipline of exposing a deliberately small tool
+  surface. Bindery exposes six tools for this reason.
+
+* codebase-memory-mcp (https://github.com/DeusData/codebase-memory-mcp) - MIT
+  Influence: the framing that structural questions should be answered from a
+  prebuilt index rather than by having the agent read files one by one.
+
+* mem0 (https://github.com/mem0ai/mem0) - Apache-2.0
+  Influence: the separation of a durable memory store from the agent runtime.
+
+* Basic Memory (https://github.com/basicmachines-co/basic-memory) - AGPL-3.0
+  Influence ONLY. No code from Basic Memory is present in this project, and
+  none was copied, adapted, or translated. The shared idea - that plain
+  Markdown files on disk should remain the source of truth so the notes stay
+  greppable, diffable, and usable by humans in Obsidian - is a design concept.
+  Bindery is licensed Apache-2.0 and is NOT a derivative work of
+  Basic Memory.
+
+* ByteRover CLI / Cipher (https://github.com/campfirein/byterover-cli) - Elastic License 2.0
+  Reviewed for design comparison only. ELv2 is not an open source license, so
+  no code from it was used, and Bindery intentionally omits the cloud
+  sync and team-workspace features that project centers on.
+
+No source code from any of the above projects is included in this
+distribution.
