@@ -245,7 +245,7 @@ def test_repeated_learning_appends_to_one_daily_file(config):
     _call(server, "memory_learn", {"content": "最初の学び。", "tags": ["a"]})
     _call(server, "memory_learn", {"content": "二番目の学び。", "tags": ["b"]})
 
-    journals = list((config.vault / "journal").glob("*.md"))
+    journals = list((config.vault / "journal").rglob("*.md"))
     assert len(journals) == 1
     body = journals[0].read_text(encoding="utf-8")
     assert "最初の学び" in body and "二番目の学び" in body

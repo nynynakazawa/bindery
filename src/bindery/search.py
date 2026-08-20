@@ -74,7 +74,9 @@ def _fts_query(raw: str) -> str:
     return " OR ".join(f'"{t}"' for t in long_terms)
 
 
-def _like_ranking(store: Store, terms: list[str], depth: int) -> list[int]:
+def _like_ranking(
+    store: Store, terms: list[str], depth: int, scope_sql: str = "", scope_params: list | None = None
+) -> list[int]:
     """Substring fallback for terms too short for the trigram index.
 
     This is a table scan, which is acceptable at the scale of a personal note
@@ -84,8 +86,8 @@ def _like_ranking(store: Store, terms: list[str], depth: int) -> list[int]:
     """
     if not terms:
         return []
-    body_clauses = ["body LIKE ? ESCAPE '\\'" for _ in terms]
-    heading_clauses = ["heading LIKE ? ESCAPE '\\'" for _ in terms]
+    body_clauses = ["chunks.body LIKE ? ESCAPE '\\'" for _ in terms]
+    heading_clauses = ["chunks.heading LIKE ? ESCAPE '\\'" for _ in terms]
     where = " OR ".join(body_clauses + heading_clauses)
     params: list[str] = []
     for term in terms:
@@ -94,15 +96,20 @@ def _like_ranking(store: Store, terms: list[str], depth: int) -> list[int]:
     params = params + list(params)
     try:
         rows = store.conn.execute(
-            f"SELECT id FROM chunks WHERE {where} ORDER BY tokens ASC LIMIT ?",
-            [*params, depth],
+            f"""SELECT chunks.id FROM chunks
+                JOIN notes ON notes.id = chunks.note_id
+                WHERE ({where}) {scope_sql}
+                ORDER BY chunks.tokens ASC LIMIT ?""",
+            [*params, *(scope_params or []), depth],
         ).fetchall()
     except Exception:
         return []
     return [int(r["id"]) for r in rows]
 
 
-def _keyword_ranking(store: Store, query: str, depth: int) -> list[int]:
+def _keyword_ranking(
+    store: Store, query: str, depth: int, scope_sql: str = "", scope_params: list | None = None
+) -> list[int]:
     long_terms, short_terms = _split_terms(query)
     ranked: list[int] = []
 
@@ -110,27 +117,32 @@ def _keyword_ranking(store: Store, query: str, depth: int) -> list[int]:
     if expression:
         try:
             rows = store.conn.execute(
-                "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? "
-                "ORDER BY bm25(chunks_fts, 2.0, 1.0) LIMIT ?",
-                (expression, depth),
+                f"""SELECT chunks_fts.rowid AS rowid FROM chunks_fts
+                    JOIN chunks ON chunks.id = chunks_fts.rowid
+                    JOIN notes ON notes.id = chunks.note_id
+                    WHERE chunks_fts MATCH ? {scope_sql}
+                    ORDER BY bm25(chunks_fts, 2.0, 1.0) LIMIT ?""",
+                (expression, *(scope_params or []), depth),
             ).fetchall()
             ranked.extend(int(r["rowid"]) for r in rows)
         except Exception:
             pass
 
     if short_terms:
-        for chunk_id in _like_ranking(store, short_terms, depth):
+        for chunk_id in _like_ranking(store, short_terms, depth, scope_sql, scope_params):
             if chunk_id not in ranked:
                 ranked.append(chunk_id)
 
     return ranked[:depth]
 
 
-def _semantic_ranking(store: Store, query: str, depth: int) -> list[int]:
+def _semantic_ranking(
+    store: Store, query: str, depth: int, scope_sql: str = "", scope_params: list | None = None
+) -> list[int]:
     backend = load_backend()
     if backend is None:
         return []
-    rows = store.all_vectors()
+    rows = store.all_vectors(scope_sql, scope_params)
     if not rows:
         return []
     try:
@@ -162,15 +174,24 @@ def search(
     limit: int | None = None,
     max_tokens: int | None = None,
     learn: bool = True,
+    scope: str = "project",
 ) -> tuple[list[Hit], dict[str, int]]:
-    """Return fused hits that fit inside the token budget."""
+    """Return fused hits that fit inside the token budget.
+
+    ``scope`` decides whose memory is searched. Defaulting to the current
+    project matters more than it looks: the agent instructions this project
+    installs say that a past decision overrides a fresh guess, so a decision
+    retrieved from an unrelated repository is not merely noise - it is
+    actively misleading, and phrased with all the authority of a real one.
+    """
     limit = limit or config.limit
     budget = max_tokens or config.max_tokens
     depth = max(limit * 4, 20)
+    scope_sql, scope_params = store.scope_clause(scope, config.project)
 
-    rankings = {"keyword": _keyword_ranking(store, query, depth)}
+    rankings = {"keyword": _keyword_ranking(store, query, depth, scope_sql, scope_params)}
     if config.semantic:
-        semantic = _semantic_ranking(store, query, depth)
+        semantic = _semantic_ranking(store, query, depth, scope_sql, scope_params)
         if semantic:
             rankings["semantic"] = semantic
 
@@ -224,3 +245,18 @@ def search(
         "considered": len(ordered),
         "truncated": truncated,
     }
+
+
+def count_outside_scope(config: Config, store: Store, query: str) -> int:
+    """How many passages a wider scope would have reached.
+
+    Without this a scoped search that finds nothing is indistinguishable from
+    an empty vault, and the agent has no reason to look further - the memory
+    would appear not to have the answer when it plainly does.
+    """
+    if not config.project:
+        return 0
+    depth = 200
+    narrow = set(_keyword_ranking(store, query, depth, *store.scope_clause("project", config.project)))
+    wide = set(_keyword_ranking(store, query, depth))
+    return len(wide - narrow)

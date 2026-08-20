@@ -8,7 +8,7 @@ defaults; explicit CLI flags override the environment.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 #: Directory that holds the SQLite index. Kept out of the vault so that the
@@ -27,6 +27,68 @@ DEFAULT_CHUNK_TOKENS = 400
 DEFAULT_CHUNK_OVERLAP = 40
 
 
+def _env_list(name: str) -> list[str]:
+    """Comma-separated vault-relative prefixes from the environment."""
+    raw = os.environ.get(name, "")
+    return _clean_prefixes(raw.split(","))
+
+
+def _clean_prefixes(values) -> list[str]:
+    """Normalise path prefixes so comparisons are not defeated by punctuation."""
+    cleaned = []
+    for value in values:
+        text = str(value).strip().strip("/").replace("\\", "/")
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
+def detect_project(start: Path | None = None) -> str:
+    """Name the codebase the agent is working in, or "" if there is no telling.
+
+    An agent's memory of "we decided to use Firebase Auth" is only true of one
+    repository, so the retrieval side needs to know which one is being asked
+    about. The MCP server is launched by the agent from the workspace, so the
+    working directory is the one signal available without configuration.
+
+    The git remote is preferred over the directory name because two checkouts
+    of the same repository - a worktree, a second clone - are the same project
+    and should share memory, while two unrelated directories that happen to be
+    named `api` are not.
+    """
+    override = os.environ.get("BINDERY_PROJECT", "").strip()
+    if override:
+        return override
+    directory = Path(start) if start else Path.cwd()
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "-C", str(directory), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            if url:
+                name = url.rstrip("/").rsplit("/", 1)[-1]
+                return name[:-4] if name.endswith(".git") else name
+        # A repository with no remote still has a root, and the root is a far
+        # better boundary than the subdirectory the agent happened to start in.
+        result = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).name
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return directory.name
+
+
 def _env_path(name: str) -> Path | None:
     raw = os.environ.get(name, "").strip()
     return Path(raw).expanduser() if raw else None
@@ -43,7 +105,7 @@ def _env_int(name: str, fallback: int) -> int:
     return value if value > 0 else fallback
 
 
-@dataclass(slots=True)
+@dataclass
 class Config:
     """Resolved runtime configuration."""
 
@@ -55,6 +117,12 @@ class Config:
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
     semantic: bool = True
     autocapture: bool = True
+    #: Vault-relative prefixes that may be indexed. Empty means "all of it".
+    include: list[str] = field(default_factory=list)
+    #: Vault-relative prefixes that must never be indexed.
+    exclude: list[str] = field(default_factory=list)
+    #: Which codebase this server is answering for. "" disables scoping.
+    project: str = ""
 
     @property
     def db_path(self) -> Path:
@@ -76,6 +144,9 @@ class Config:
         max_tokens: int | None = None,
         limit: int | None = None,
         semantic: bool | None = None,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+        project: str | None = None,
     ) -> "Config":
         resolved_vault = (
             Path(vault).expanduser()
@@ -103,6 +174,9 @@ class Config:
             chunk_overlap=_env_int("BINDERY_CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP),
             semantic=resolved_semantic,
             autocapture=env_capture not in {"0", "off", "false", "no"},
+            include=_clean_prefixes(include) if include else _env_list("BINDERY_INCLUDE"),
+            exclude=_clean_prefixes(exclude) if exclude else _env_list("BINDERY_EXCLUDE"),
+            project=(project if project is not None else detect_project()),
         )
 
 

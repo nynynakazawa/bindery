@@ -25,6 +25,39 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vault", help="Directory of Markdown notes (default: $BINDERY_VAULT).")
     parser.add_argument("--state-dir", help="Where to keep the index.")
     parser.add_argument("--no-semantic", action="store_true", help="Keyword search only.")
+    parser.add_argument(
+        "--include",
+        action="append",
+        metavar="DIR",
+        help=(
+            "Index ONLY this vault-relative directory. Repeatable. Naming any "
+            "directory excludes everything else - use it when the vault holds "
+            "more than work notes."
+        ),
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        metavar="DIR",
+        help="Never index this vault-relative directory. Repeatable.",
+    )
+
+
+
+def _add_project(parser: argparse.ArgumentParser) -> None:
+    """Only for commands that read or write notes.
+
+    `install` and `setup` already spell a different concept `--project` - which
+    config file to write - so the flag stays off the shared block rather than
+    meaning two things one subcommand apart.
+    """
+    parser.add_argument(
+        "--project",
+        help=(
+            "Name the codebase these notes belong to (default: detected from the "
+            "git remote of the working directory). Pass '' to disable scoping."
+        ),
+    )
 
 
 def _config_from(args: argparse.Namespace) -> Config:
@@ -34,6 +67,11 @@ def _config_from(args: argparse.Namespace) -> Config:
         max_tokens=getattr(args, "max_tokens", None),
         limit=getattr(args, "limit", None),
         semantic=False if getattr(args, "no_semantic", False) else None,
+        include=getattr(args, "include", None),
+        exclude=getattr(args, "exclude", None),
+        # install/setup use --project as a flag meaning "write the config file
+        # into this directory", so only accept the string form here.
+        project=args.project if isinstance(getattr(args, "project", None), str) else None,
     )
 
 
@@ -225,6 +263,12 @@ It is not scratch space - what you write, the next session reads.
 - **Before starting work**, call `memory_search` for prior decisions on the
   topic. Do this even when you think you know the answer; a past decision
   overrides a fresh guess.
+- Searches are **scoped to the current project** by default, plus notes marked
+  as applying everywhere. If the answer might not be project-specific - a
+  language idiom, a tool's behaviour, a workflow preference - repeat the search
+  with `scope="all"`. The result will tell you when matches exist elsewhere.
+  Treat a decision from another repository as context, never as this project's
+  decision.
 - **When you learn something the next session would otherwise rediscover**,
   call `memory_learn` immediately - do not wait until the end. Record it when
   any of these is true:
@@ -239,6 +283,8 @@ It is not scratch space - what you write, the next session reads.
   signal and crowds it out.
 - Use `memory_write` for durable reference notes, `memory_learn` for the
   running record of what a session figured out.
+- Both record the current project automatically. Pass `project=""` when what
+  you learned is true regardless of which codebase you are in.
 """
 
 
@@ -572,18 +618,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_serve = sub.add_parser("serve", help="Run the MCP server on stdio (what agents launch).")
     _add_common(p_serve)
+    _add_project(p_serve)
     p_serve.add_argument("--max-tokens", type=int, help="Default response budget.")
     p_serve.add_argument("--limit", type=int, help="Default passages per search.")
     p_serve.set_defaults(func=cmd_serve)
 
     p_index = sub.add_parser("index", help="Scan the vault and refresh the index.")
     _add_common(p_index)
+    _add_project(p_index)
     p_index.add_argument("--force", action="store_true", help="Reindex every note.")
     p_index.add_argument("--embed", action="store_true", help="Also compute missing embeddings.")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search from the terminal.")
     _add_common(p_search)
+    _add_project(p_search)
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int)
     p_search.add_argument("--max-tokens", type=int)
@@ -592,10 +641,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show index health. Exits non-zero on problems.")
     _add_common(p_status)
+    _add_project(p_status)
     p_status.set_defaults(func=cmd_status)
 
     p_review = sub.add_parser("review", help="Show how the memory is growing and what needs attention.")
     _add_common(p_review)
+    _add_project(p_review)
     p_review.add_argument("--min-count", type=int, default=2,
                           help="Minimum repeats before an unanswered query counts as a gap.")
     p_review.add_argument("--json", action="store_true")

@@ -41,12 +41,68 @@ SKIP_DIRS = {".git", ".obsidian", ".trash", "node_modules", "__pycache__", ".bin
 SKIP_PREFIXES = ("journal/sessions/",)
 
 
+def _under(rel: str, prefix: str) -> bool:
+    """Is ``rel`` the file ``prefix`` or something inside the directory ``prefix``?
+
+    Prefix comparison on raw strings would make ``private`` also match
+    ``private-ish-notes.md``, which is the wrong way for a privacy boundary to
+    fail.
+    """
+    rel = rel.replace("\\", "/").strip("/")
+    prefix = prefix.replace("\\", "/").strip("/")
+    return rel == prefix or rel.startswith(prefix + "/")
+
+
+def is_indexable(rel: str, *, include=(), exclude=()) -> bool:
+    """Whether one note is inside the boundary the user drew.
+
+    Pointing Bindery at an existing Obsidian vault is the documented happy
+    path, and vaults hold more than engineering notes - a diary, client work,
+    anything a person keeps. Everything indexed here can come back from
+    ``memory_search`` and land in an agent's context, which for a hosted model
+    means leaving the machine. So the boundary is explicit and enforced in one
+    place, and ``include`` is an allowlist: naming any directory means nothing
+    outside it is ever read.
+    """
+    rel = rel.replace("\\", "/")
+    if rel.startswith(SKIP_PREFIXES):
+        return False
+    if any(_under(rel, prefix) for prefix in exclude):
+        return False
+    if include:
+        return any(_under(rel, prefix) for prefix in include)
+    return True
+
+
+def project_of(rel: str, meta: dict[str, str] | None = None) -> str:
+    """Which codebase a note belongs to, or "" for knowledge that spans them.
+
+    Front matter wins, because a note can then be moved without changing what
+    it is about. The directory is the fallback, which makes the convention of
+    one folder per project work with no metadata at all - and a note sitting
+    loose at the vault root is genuinely general, so it stays unscoped.
+    """
+    if meta:
+        declared = str(meta.get("project", "")).strip()
+        if declared:
+            return declared
+    parts = [part for part in rel.replace("\\", "/").split("/") if part]
+    if not parts:
+        return ""
+    if parts[0] == "journal":
+        # journal/<project>/<date>.md - a dated file directly under journal/
+        # predates project scoping and is left global.
+        return parts[1] if len(parts) > 2 else ""
+    return parts[0] if len(parts) > 1 else ""
+
+
 @dataclass(slots=True)
 class ParsedNote:
     title: str
     tags: list[str]
     body: str
     links: list[str] = field(default_factory=list)
+    project: str = ""
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -91,7 +147,10 @@ def parse_note(path: Path, text: str) -> ParsedNote:
         title = path.stem
     tags = _split_tags(meta.get("tags", ""))
     links = sorted({m.group(1).strip() for m in WIKILINK_RE.finditer(text)})
-    return ParsedNote(title=title, tags=tags, body=body, links=links)
+    return ParsedNote(
+        title=title, tags=tags, body=body, links=links,
+        project=str(meta.get("project", "")).strip(),
+    )
 
 
 def chunk_markdown(body: str, *, max_tokens: int, overlap: int) -> list[tuple[str, str, int]]:
@@ -150,15 +209,12 @@ def digest_of(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
-def is_indexable(rel: str) -> bool:
-    return not rel.replace("\\", "/").startswith(SKIP_PREFIXES)
-
-
-def iter_markdown(vault: Path):
-    for path in sorted(vault.rglob("*.md")):
+def iter_markdown(config: Config):
+    for path in sorted(config.vault.rglob("*.md")):
         if any(part in SKIP_DIRS for part in path.parts):
             continue
-        if not is_indexable(str(path.relative_to(vault))):
+        rel = str(path.relative_to(config.vault))
+        if not is_indexable(rel, include=config.include, exclude=config.exclude):
             continue
         yield path
 
@@ -192,7 +248,7 @@ def reindex(config: Config, store: Store, *, force: bool = False) -> IndexReport
         return report
 
     seen: set[str] = set()
-    for path in iter_markdown(config.vault):
+    for path in iter_markdown(config):
         rel = str(path.relative_to(config.vault))
         seen.add(rel)
         report.scanned += 1
@@ -218,6 +274,7 @@ def reindex(config: Config, store: Store, *, force: bool = False) -> IndexReport
             path=rel,
             title=note.title,
             tags=note.tags,
+            project=project_of(rel, {"project": note.project}),
             mtime=path.stat().st_mtime,
             digest=digest,
             chunks=chunks,

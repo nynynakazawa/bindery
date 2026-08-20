@@ -30,9 +30,9 @@ from .growth import (
     promotion_candidates,
     stale_notes,
 )
-from .indexer import reindex
+from .indexer import is_indexable, reindex
 from .safeio import update_text
-from .search import search
+from .search import count_outside_scope, search
 from .store import Store
 from .tokens import estimate_tokens
 
@@ -50,6 +50,16 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "What to look for."},
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global", "all"],
+                    "description": (
+                        "Which memory to search. 'project' (default) is this codebase plus "
+                        "notes that apply everywhere; 'global' is only the cross-project "
+                        "notes; 'all' ignores project boundaries. A decision from another "
+                        "repository is not evidence about this one, so widen deliberately."
+                    ),
+                },
                 "limit": {"type": "integer", "description": "Maximum passages to return."},
                 "max_tokens": {
                     "type": "integer",
@@ -92,6 +102,13 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Mark as durable so it always ranks high and never goes stale.",
                 },
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Which codebase this note is about. Defaults to the current one. "
+                        "Pass an empty string for knowledge that is true everywhere."
+                    ),
+                },
             },
             "required": ["path", "content"],
         },
@@ -113,6 +130,13 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Topic tags, e.g. ['auth', 'deployment'].",
+                },
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Which codebase this applies to. Defaults to the current one. "
+                        "Pass an empty string for a lesson that is not project-specific."
+                    ),
                 },
             },
             "required": ["content"],
@@ -138,7 +162,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "memory_status",
-        "description": "Report vault location, index size, and whether semantic search is active.",
+        "description": "Report vault location, index size, the current project, the index boundary, and whether semantic search is active.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -176,13 +200,30 @@ class MemoryServer:
         query = str(args.get("query", "")).strip()
         if not query:
             return "query is required."
-        hits, meta = search(
-            self.config,
-            self.store,
-            query,
-            limit=args.get("limit"),
-            max_tokens=args.get("max_tokens"),
-        )
+        scope = str(args.get("scope", "project")).strip().lower()
+        if scope not in {"project", "global", "all"}:
+            scope = "project"
+        def run(in_scope: str):
+            return search(
+                self.config,
+                self.store,
+                query,
+                limit=args.get("limit"),
+                max_tokens=args.get("max_tokens"),
+                scope=in_scope,
+            )
+
+        hits, meta = run(scope)
+        widened = False
+        if not hits and scope == "project" and self.config.project:
+            # Narrowing must never be the reason an answer is missed. When the
+            # project has nothing to say, the wider memory answers - labelled,
+            # so the agent can weigh it as another project's decision rather
+            # than as this one's. Without this the first search in a new or
+            # renamed project reports an empty memory that is in fact full.
+            hits, meta = run("all")
+            widened = bool(hits)
+
         self.session.searches += 1
         if not hits and query not in self.session.unanswered:
             self.session.unanswered.append(query)
@@ -192,22 +233,63 @@ class MemoryServer:
                 hint = f" {meta['truncated']} match(es) were dropped by the token budget; raise max_tokens."
             return f"No passages matched {query!r}.{hint}"
 
-        lines = [f"{meta['returned']} passage(s), ~{meta['tokens']} tokens."]
+        if widened:
+            header = (
+                f"{meta['returned']} passage(s), ~{meta['tokens']} tokens. "
+                f"Nothing in project '{self.config.project}' matched, so this is "
+                "the whole memory - each passage is labelled with the project it "
+                "came from, and another project's decision is not this one's."
+            )
+        else:
+            header = f"{meta['returned']} passage(s), ~{meta['tokens']} tokens{self._scope_label(scope)}."
+        lines = [header]
         if meta["truncated"]:
             lines.append(f"({meta['truncated']} further match(es) omitted to stay inside the budget.)")
         lines.append("")
         for hit in hits:
             location = f"{hit.chunk.path}" + (f" # {hit.chunk.heading}" if hit.chunk.heading else "")
-            lines.append(f"--- {location}  [{hit.matched_by}]")
+            origin = f"  [{hit.chunk.project}]" if hit.chunk.project else "  [global]"
+            lines.append(f"--- {location}{origin}  [{hit.matched_by}]")
             lines.append(hit.chunk.body)
             lines.append("")
-        return "\n".join(lines).rstrip()
+        tail = "" if widened else self._widen_hint(query, scope)
+        return "\n".join(lines).rstrip() + tail
+
+    def _scope_label(self, scope: str) -> str:
+        if scope == "all" or not self.config.project:
+            return ""
+        if scope == "global":
+            return " (cross-project notes only)"
+        return f" (project '{self.config.project}' + cross-project notes)"
+
+    def _widen_hint(self, query: str, scope: str) -> str:
+        """Tell the agent when the answer exists but sits outside the scope.
+
+        A narrow default is only safe if it is visible. Otherwise a scoped
+        search that finds nothing looks exactly like an empty memory, and the
+        agent stops looking - which would make scoping worse than not having
+        it.
+        """
+        if scope != "project" or not self.config.project:
+            return ""
+        elsewhere = count_outside_scope(self.config, self.store, query)
+        if not elsewhere:
+            return ""
+        return (
+            f"\n\n({elsewhere} more passage(s) exist in other projects. "
+            'Repeat with scope="all" if this question is not project-specific.)'
+        )
 
     def tool_memory_read(self, args: dict[str, Any]) -> str:
         rel = str(args.get("path", "")).strip()
         target = self._safe_path(rel)
         if target is None:
             return f"Refused: {rel!r} is outside the vault."
+        if not is_indexable(rel, include=self.config.include, exclude=self.config.exclude):
+            # Otherwise the allowlist would only cover search, and any path an
+            # agent guessed - or read in a wiki link - would walk straight
+            # through it.
+            return f"Refused: {rel!r} is outside the configured index boundary."
         if not target.exists():
             return f"Not found: {rel}"
         text = target.read_text(encoding="utf-8")
@@ -233,15 +315,24 @@ class MemoryServer:
         target = self._safe_path(rel)
         if target is None:
             return f"Refused: {rel!r} is outside the vault."
+        if not is_indexable(rel, include=self.config.include, exclude=self.config.exclude):
+            return f"Refused: {rel!r} is outside the configured index boundary."
         content = str(args.get("content", ""))
         title = str(args.get("title", "")).strip()
         tags = args.get("tags") or []
+        # Recorded in the note itself rather than inferred from where it sits,
+        # so that moving the file does not change what it is understood to be
+        # about. Passing an empty string marks knowledge that spans projects.
+        project = args.get("project")
+        project = self.config.project if project is None else str(project).strip()
 
         front: list[str] = []
-        if title or tags:
+        if title or tags or project:
             front.append("---")
             if title:
                 front.append(f"title: {title}")
+            if project:
+                front.append(f"project: {project}")
             if tags:
                 front.append("tags: [" + ", ".join(str(t) for t in tags) + "]")
             front.append("---")
@@ -276,7 +367,12 @@ class MemoryServer:
         tags = [str(t).strip() for t in raw_tags if str(t).strip()]
 
         today = datetime.date.today().isoformat()
-        rel = f"journal/{today}.md"
+        project = args.get("project")
+        project = self.config.project if project is None else str(project).strip()
+        # One journal per project per day. A single global journal would make
+        # every day's entries a mixture of unrelated codebases, which is the
+        # one file a scoped search can never usefully filter.
+        rel = f"journal/{project}/{today}.md" if project else f"journal/{today}.md"
         target = self._safe_path(rel)
         if target is None:
             return "Refused: journal path resolved outside the vault."
@@ -305,6 +401,8 @@ class MemoryServer:
 
             merged = sorted({*existing_tags, *tags})
             header = ["---", f"title: Journal {today}"]
+            if project:
+                header.append(f"project: {project}")
             if merged:
                 header.append("tags: [" + ", ".join(merged) + "]")
             header += ["---", ""]
@@ -417,6 +515,10 @@ class MemoryServer:
                 "default_max_tokens": self.config.max_tokens,
                 "semantic_search": backend.name if backend else "off (keyword only)",
                 "embedded_passages": stats["vectors"],
+                "project": self.config.project or "(none - every search is global)",
+                "projects_indexed": dict(self.store.projects()),
+                "indexed_only": self.config.include or "(whole vault)",
+                "never_indexed": self.config.exclude or [],
             },
             ensure_ascii=False,
             indent=2,

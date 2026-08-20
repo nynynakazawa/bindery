@@ -57,7 +57,7 @@ def test_concurrent_learn_keeps_every_entry(tmp_path):
     failed = [r for r in results if r.returncode != 0]
     assert not failed, "worker failed:\n" + "\n".join(r.stderr for r in failed)
 
-    journals = list((vault / "journal").glob("*.md"))
+    journals = list((vault / "journal").rglob("*.md"))
     assert len(journals) == 1
     body = journals[0].read_text(encoding="utf-8")
 
@@ -80,7 +80,7 @@ def test_concurrent_learn_leaves_valid_frontmatter(tmp_path):
     payloads = [(f"note-{i:02d}", f"t{i:02d}") for i in range(6)]
     _run_workers(LEARN_WORKER, vault, state, payloads)
 
-    journal = next((vault / "journal").glob("*.md"))
+    journal = next((vault / "journal").rglob("*.md"))
     text = journal.read_text(encoding="utf-8")
     meta, body = parse_frontmatter(text)
 

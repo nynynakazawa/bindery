@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -30,8 +30,11 @@ CREATE TABLE IF NOT EXISTS notes (
     title    TEXT NOT NULL DEFAULT '',
     tags     TEXT NOT NULL DEFAULT '[]',
     mtime    REAL NOT NULL DEFAULT 0,
-    digest   TEXT NOT NULL DEFAULT ''
+    digest   TEXT NOT NULL DEFAULT '',
+    -- Which codebase this note is about; '' means it spans all of them.
+    project  TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS notes_project ON notes(project);
 
 CREATE TABLE IF NOT EXISTS chunks (
     id       INTEGER PRIMARY KEY,
@@ -108,6 +111,7 @@ class Chunk:
     heading: str
     body: str
     tokens: int
+    project: str = ""
 
 
 def pack_vector(values: list[float]) -> bytes:
@@ -140,6 +144,7 @@ class Store:
         # same index open at once without either of them erroring out.
         self.conn.execute("PRAGMA busy_timeout=15000")
         self._depth = 0
+        self._migrate()
         # Outside a transaction on purpose: sqlite3.executescript() issues an
         # implicit COMMIT before it runs, which would silently close one we
         # had opened. Every statement is CREATE ... IF NOT EXISTS, so two
@@ -147,6 +152,32 @@ class Store:
         self.conn.executescript(_SCHEMA)
         with self.write():
             self.set_meta("schema_version", str(SCHEMA_VERSION))
+
+    def _migrate(self) -> None:
+        """Drop derived tables when their shape changed, keeping what is learned.
+
+        Everything describing the notes is rebuilt from Markdown on the next
+        scan, so an old layout is discarded rather than migrated - there is
+        nothing in it that the vault does not already say. The growth tables
+        are the exception: retrieval history exists nowhere else, and it is
+        keyed by note path, which no schema change here invalidates.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return
+        if row is None or str(row[0]) == str(SCHEMA_VERSION):
+            return
+        for statement in (
+            "DROP TABLE IF EXISTS chunks_fts",
+            "DROP TABLE IF EXISTS vectors",
+            "DROP TABLE IF EXISTS links",
+            "DROP TABLE IF EXISTS chunks",
+            "DROP TABLE IF EXISTS notes",
+        ):
+            self.conn.execute(statement)
 
     # -------------------------------------------------------- transactions
 
@@ -233,12 +264,13 @@ class Store:
         digest: str,
         chunks: list[tuple[str, str, int]],
         links: list[str],
+        project: str = "",
     ) -> int:
         """Replace a note and all of its derived rows atomically."""
         with self.write():
             return self._upsert_note_locked(
                 path=path, title=title, tags=tags, mtime=mtime,
-                digest=digest, chunks=chunks, links=links,
+                digest=digest, chunks=chunks, links=links, project=project,
             )
 
     def _upsert_note_locked(
@@ -251,11 +283,12 @@ class Store:
         digest: str,
         chunks: list[tuple[str, str, int]],
         links: list[str],
+        project: str = "",
     ) -> int:
         self.delete_note(path)
         cur = self.conn.execute(
-            "INSERT INTO notes(path, title, tags, mtime, digest) VALUES(?,?,?,?,?)",
-            (path, title, json.dumps(tags, ensure_ascii=False), mtime, digest),
+            "INSERT INTO notes(path, title, tags, mtime, digest, project) VALUES(?,?,?,?,?,?)",
+            (path, title, json.dumps(tags, ensure_ascii=False), mtime, digest, project),
         )
         note_id = int(cur.lastrowid)
         for seq, (heading, body, tokens) in enumerate(chunks):
@@ -272,6 +305,26 @@ class Store:
             self.conn.execute("INSERT INTO links(src_note_id, target) VALUES(?,?)", (note_id, target))
         return note_id
 
+    # --------------------------------------------------------------- scope
+
+    def scope_clause(self, scope: str, project: str) -> tuple[str, list[str]]:
+        """SQL restricting a ranking to one project's memory.
+
+        Filtering here rather than after ranking is deliberate: taking the top
+        N and then discarding other projects' rows would return fewer results
+        the more crowded the vault gets, which is the opposite of what the
+        caller asked for.
+
+        Unscoped notes are included alongside the current project because a
+        note that is not about any one codebase - a language idiom, a workflow
+        preference - is exactly the knowledge worth carrying between them.
+        """
+        if scope == "all" or not project:
+            return "", []
+        if scope == "global":
+            return "AND notes.project = ''", []
+        return "AND (notes.project = ? OR notes.project = '')", [project]
+
     # -------------------------------------------------------------- chunks
 
     def chunk_rows(self, chunk_ids: list[int]) -> dict[int, Chunk]:
@@ -279,7 +332,8 @@ class Store:
             return {}
         marks = ",".join("?" * len(chunk_ids))
         rows = self.conn.execute(
-            f"""SELECT c.id, c.note_id, c.heading, c.body, c.tokens, n.path, n.title
+            f"""SELECT c.id, c.note_id, c.heading, c.body, c.tokens,
+                       n.path, n.title, n.project
                 FROM chunks c JOIN notes n ON n.id = c.note_id
                 WHERE c.id IN ({marks})""",
             chunk_ids,
@@ -293,6 +347,7 @@ class Store:
                 heading=r["heading"],
                 body=r["body"],
                 tokens=r["tokens"],
+                project=r["project"],
             )
             for r in rows
         }
@@ -310,8 +365,23 @@ class Store:
             (chunk_id, len(values), pack_vector(values)),
         )
 
-    def all_vectors(self):
-        return self.conn.execute("SELECT chunk_id, dim, vec FROM vectors").fetchall()
+    def all_vectors(self, scope_sql: str = "", scope_params: list | None = None):
+        return self.conn.execute(
+            "SELECT v.chunk_id, v.dim, v.vec FROM vectors v "
+            "JOIN chunks ON chunks.id = v.chunk_id "
+            "JOIN notes ON notes.id = chunks.note_id "
+            f"WHERE 1=1 {scope_sql}",
+            scope_params or [],
+        ).fetchall()
+
+    def projects(self) -> list[tuple[str, int]]:
+        """Every project the vault knows about, with note counts."""
+        return [
+            (r["project"], int(r["n"]))
+            for r in self.conn.execute(
+                "SELECT project, COUNT(*) AS n FROM notes GROUP BY project ORDER BY n DESC"
+            )
+        ]
 
     # --------------------------------------------------------------- stats
 
