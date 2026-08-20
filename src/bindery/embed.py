@@ -23,6 +23,23 @@ class EmbeddingBackend(Protocol):
     def encode(self, texts: list[str]) -> list[list[float]]: ...
 
 
+#: Multilingual models, smallest first. A list rather than one name because
+#: pinning a single one is how semantic search quietly stopped working:
+#: `intfloat/multilingual-e5-small` was hard-coded here, fastembed dropped it
+#: from its registry, every construction raised, and the exception was caught
+#: and read as "no backend installed". Installing the extra did nothing and
+#: said nothing.
+#:
+#: Multilingual is the requirement, not a preference - an English-only model
+#: cannot embed the Japanese half of a bilingual vault.
+MULTILINGUAL_MODELS = (
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "intfloat/multilingual-e5-small",
+    "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+    "intfloat/multilingual-e5-large",
+)
+
+
 class _FastEmbedBackend:
     """`fastembed` - ONNX runtime, no torch, multilingual model available."""
 
@@ -31,8 +48,22 @@ class _FastEmbedBackend:
     def __init__(self) -> None:
         from fastembed import TextEmbedding  # type: ignore[import-not-found]
 
-        self._model = TextEmbedding(model_name="intfloat/multilingual-e5-small")
-        self.dim = 384
+        try:
+            available = {m["model"]: m for m in TextEmbedding.list_supported_models()}
+        except Exception:
+            available = {}
+        for candidate in MULTILINGUAL_MODELS:
+            if available and candidate not in available:
+                continue
+            try:
+                self._model = TextEmbedding(model_name=candidate)
+            except Exception:
+                continue
+            self.model_name = candidate
+            entry = available.get(candidate) or {}
+            self.dim = int(entry.get("dim") or len(self.encode(["dimension probe"])[0]))
+            return
+        raise RuntimeError("fastembed has no supported multilingual model")
 
     def encode(self, texts: list[str]) -> list[list[float]]:
         return [list(map(float, vec)) for vec in self._model.embed(texts)]
@@ -46,8 +77,17 @@ class _SentenceTransformersBackend:
     def __init__(self) -> None:
         from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
 
-        self._model = SentenceTransformer("intfloat/multilingual-e5-small")
-        self.dim = int(self._model.get_sentence_embedding_dimension())
+        last: Exception | None = None
+        for candidate in MULTILINGUAL_MODELS:
+            try:
+                self._model = SentenceTransformer(candidate)
+            except Exception as exc:
+                last = exc
+                continue
+            self.model_name = candidate
+            self.dim = int(self._model.get_sentence_embedding_dimension())
+            return
+        raise RuntimeError(f"no multilingual model could be loaded: {last}")
 
     def encode(self, texts: list[str]) -> list[list[float]]:
         vectors = self._model.encode(texts, normalize_embeddings=False)

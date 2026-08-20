@@ -45,11 +45,12 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_project(parser: argparse.ArgumentParser) -> None:
-    """Only for commands that read or write notes.
+    """Name the codebase whose memory this command is about.
 
-    `install` and `setup` already spell a different concept `--project` - which
-    config file to write - so the flag stays off the shared block rather than
-    meaning two things one subcommand apart.
+    Every subcommand takes it, and it means the same thing in all of them. It
+    briefly did not: `install` and `setup` used `--project` for which config
+    file to write, so `setup --project alpha` was a parse error rather than a
+    way to name a project. That flag is `--local` now.
     """
     parser.add_argument(
         "--project",
@@ -69,9 +70,7 @@ def _config_from(args: argparse.Namespace) -> Config:
         semantic=False if getattr(args, "no_semantic", False) else None,
         include=getattr(args, "include", None),
         exclude=getattr(args, "exclude", None),
-        # install/setup use --project as a flag meaning "write the config file
-        # into this directory", so only accept the string form here.
-        project=args.project if isinstance(getattr(args, "project", None), str) else None,
+        project=getattr(args, "project", None),
     )
 
 
@@ -528,7 +527,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     primary and the other an afterthought.
     """
     config = _config_from(args)
-    scope = "project" if getattr(args, "project", False) else "user"
+    scope = "project" if getattr(args, "local", False) else "user"
     targets = _client_targets(config, scope)
     chosen = [args.client] if args.client else sorted(targets)
     detected = _detect_clients()
@@ -580,7 +579,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print(f"  would index {config.vault}")
 
     print("\n[2/3] MCP server configuration")
-    targets = _client_targets(config, "project" if args.project else "user")
+    targets = _client_targets(config, "project" if args.local else "user")
     detected = _detect_clients()
     for client in sorted(targets):
         spec = targets[client]
@@ -654,21 +653,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_install = sub.add_parser("install", help="Print (or apply) configuration for every agent.")
     _add_common(p_install)
+    _add_project(p_install)
     p_install.add_argument("client", nargs="?", choices=["claude", "codex"],
                            help="Limit output to one client. Default: all of them.")
     p_install.add_argument("--write", action="store_true",
                            help="Apply the configuration instead of printing it. Backs up first.")
-    p_install.add_argument("--project", action="store_true",
-                           help="Configure Claude Code for this project only (.mcp.json) instead "
-                                "of every project. Codex has no project scope and is unaffected.")
+    p_install.add_argument("--local", action="store_true",
+                           help="Configure Claude Code for this directory only (./.mcp.json) "
+                                "instead of every project. Codex has no project scope and is "
+                                "unaffected.")
     p_install.set_defaults(func=cmd_install)
 
     p_setup = sub.add_parser("setup", help="Index, configure every agent, and install the instructions.")
     _add_common(p_setup)
+    _add_project(p_setup)
     p_setup.add_argument("--write", action="store_true",
                          help="Apply the changes. Without this, setup only reports what it would do.")
-    p_setup.add_argument("--project", action="store_true",
-                         help="Configure Claude Code for this project only instead of globally.")
+    p_setup.add_argument("--local", action="store_true",
+                         help="Configure Claude Code for this directory only (./.mcp.json) "
+                              "instead of globally.")
     p_setup.set_defaults(func=cmd_setup)
 
     p_prompt = sub.add_parser("prompt", help="Print the agent instructions that make the memory grow.")

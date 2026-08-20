@@ -122,8 +122,8 @@ activated - which it is not when an agent launches the server. Use `pip` only
 inside a virtualenv you manage yourself, and expect to point your agents at the
 full path.
 
-Optional semantic search (adds a local embedding model, roughly 100 MB, no API
-calls and no per-query cost):
+Optional semantic search (adds a local multilingual embedding model, about
+220 MB, downloaded once - no API calls and no per-query cost):
 
 ```bash
 uv tool install '.[semantic]'

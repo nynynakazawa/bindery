@@ -222,7 +222,7 @@ def test_install_project_scope_writes_the_project_file(tmp_path, monkeypatch, co
     monkeypatch.chdir(tmp_path)
     from bindery.cli import main
 
-    main(["install", "claude", "--write", "--project", "--vault", str(config.vault)])
+    main(["install", "claude", "--write", "--local", "--vault", str(config.vault)])
     assert (tmp_path / ".mcp.json").exists()
 
 
