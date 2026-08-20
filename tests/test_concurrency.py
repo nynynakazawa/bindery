@@ -69,6 +69,41 @@ def test_concurrent_learn_keeps_every_entry(tmp_path):
         assert tag in body
 
 
+OPEN_WORKER = textwrap.dedent(
+    """
+    import sys
+    sys.path.insert(0, sys.argv[1])
+    from pathlib import Path
+    from bindery.store import Store
+
+    Store(Path(sys.argv[2]) / "index.db").close()
+    """
+)
+
+
+def test_many_agents_can_open_a_fresh_index_at_once(tmp_path):
+    """Cold start is the moment several agents are most likely to collide.
+
+    Turning on WAL takes a brief exclusive lock. If the busy timeout is not
+    already in force, whichever process loses the race does not wait - it
+    fails outright with "database is locked" before it has served anything.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+
+    def run(_n):
+        return subprocess.run(
+            [sys.executable, "-c", OPEN_WORKER, SRC, str(state)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(run, range(12)))
+
+    failed = [r for r in results if r.returncode != 0]
+    assert not failed, "cold start failed:\n" + "\n".join(r.stderr for r in failed)
+
+
 def test_concurrent_learn_leaves_valid_frontmatter(tmp_path):
     """A merge that interleaves badly would produce two front matter blocks."""
     from bindery.indexer import parse_frontmatter

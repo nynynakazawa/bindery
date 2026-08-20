@@ -54,18 +54,40 @@ class _SentenceTransformersBackend:
         return [list(map(float, vec)) for vec in vectors]
 
 
+#: Resolved once per process. ``False`` records "looked, found nothing", which
+#: is different from "not looked yet" - without that distinction every search
+#: on a machine with no backend installed would retry two imports.
+_BACKEND: "EmbeddingBackend | None | bool" = False
+
+
 def load_backend() -> EmbeddingBackend | None:
     """Return the first available backend, or ``None`` when none is installed.
+
+    Cached, because constructing a backend loads an ONNX model from disk - a
+    matter of seconds. This is called on every semantic search and after every
+    write, so paying that once per process rather than once per call is the
+    difference between semantic search being usable and being unusable.
 
     A missing backend is a normal, supported state rather than an error: the
     keyword index alone is a working system.
     """
+    global _BACKEND
+    if _BACKEND is not False:
+        return _BACKEND  # type: ignore[return-value]
     for factory in (_FastEmbedBackend, _SentenceTransformersBackend):
         try:
-            return factory()  # type: ignore[return-value]
+            _BACKEND = factory()  # type: ignore[assignment]
+            return _BACKEND  # type: ignore[return-value]
         except Exception:
             continue
+    _BACKEND = None
     return None
+
+
+def reset_backend() -> None:
+    """Forget the cached backend. For tests."""
+    global _BACKEND
+    _BACKEND = False
 
 
 def cosine(a: list[float], b: list[float]) -> float:

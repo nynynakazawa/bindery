@@ -30,7 +30,7 @@ from .growth import (
     promotion_candidates,
     stale_notes,
 )
-from .indexer import is_indexable, reindex
+from .indexer import index_path, is_indexable, refresh_embeddings, reindex
 from .safeio import update_text
 from .search import count_outside_scope, search
 from .store import Store
@@ -194,6 +194,17 @@ class MemoryServer:
         self.client_name = ""
         self._finalized = False
 
+    def _index_written(self, rel: str) -> None:
+        """Bring the index up to date for the one note that just changed.
+
+        The other agent must be able to find this immediately - that is the
+        whole point of writing it - so this is synchronous, and being scoped to
+        a single file is what keeps it affordable to do on every write.
+        """
+        target = self.config.vault / rel
+        index_path(self.config, self.store, target)
+        refresh_embeddings(self.config, self.store, self.store.chunk_ids_for(rel))
+
     # ----------------------------------------------------------- tool impls
 
     def tool_memory_search(self, args: dict[str, Any]) -> str:
@@ -343,7 +354,7 @@ class MemoryServer:
         # land in the middle of a concurrent read-modify-write of the same note.
         update_text(target, lambda _current: body, lock_dir=self.config.state_dir)
 
-        reindex(self.config, self.store)
+        self._index_written(rel)
         if args.get("pin"):
             self.store.set_pinned(rel, True)
             self.store.commit()
@@ -416,7 +427,7 @@ class MemoryServer:
             return "\n".join(header) + body.lstrip("\n") + "\n"
 
         update_text(target, append_entry, lock_dir=self.config.state_dir)
-        reindex(self.config, self.store)
+        self._index_written(rel)
         self.session.learned += 1
         return f"Recorded in {rel} (~{estimate_tokens(content)} tokens)." + (
             f" Tags: {', '.join(tags)}." if tags else ""
@@ -584,7 +595,7 @@ class MemoryServer:
         update_text(target, append_record, lock_dir=self.config.state_dir)
 
         try:
-            reindex(self.config, self.store)
+            index_path(self.config, self.store, target)
             self.store.prune_queries()
             self.store.commit()
         except Exception:

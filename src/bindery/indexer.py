@@ -237,49 +237,145 @@ class IndexReport:
         }
 
 
-def reindex(config: Config, store: Store, *, force: bool = False) -> IndexReport:
-    """Bring the index in line with the vault.
+def _write_note(config: Config, store: Store, path: Path, rel: str, text: str, digest: str) -> None:
+    note = parse_note(path, text)
+    chunks = chunk_markdown(
+        note.body,
+        max_tokens=config.chunk_tokens,
+        overlap=config.chunk_overlap,
+    )
+    if not chunks:
+        chunks = [("", note.title, estimate_tokens(note.title))]
+    store.upsert_note(
+        path=rel,
+        title=note.title,
+        tags=note.tags,
+        project=project_of(rel, {"project": note.project}),
+        mtime=path.stat().st_mtime,
+        digest=digest,
+        chunks=chunks,
+        links=note.links,
+    )
 
-    Content digests rather than mtimes decide what changed, so a file that is
-    touched but not edited costs nothing to re-scan.
+
+def refresh_embeddings(config: Config, store: Store, chunk_ids: list[int] | None = None) -> int:
+    """Embed passages that have no vector yet, newest write first.
+
+    Reindexing a note drops its old chunks, and their vectors go with them.
+    Nothing used to put vectors back except an explicit `bindery index
+    --embed`, so semantic coverage decayed exactly as the memory grew: every
+    `memory_learn` replaced embedded passages with unembedded ones, and the
+    hybrid ranking quietly degraded towards keyword-only for the newest and
+    most relevant material.
+
+    Passing ``chunk_ids`` limits the work to one note, which is what the write
+    path wants - keeping its own note current is bounded work, while
+    backfilling an entire vault is a job for the CLI.
+    """
+    if not config.semantic:
+        return 0
+    from .embed import load_backend
+
+    backend = load_backend()
+    if backend is None:
+        return 0
+    rows = list(store.chunks_missing_vectors(chunk_ids))
+    if not rows:
+        return 0
+    done = 0
+    batch_size = 32
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start : start + batch_size]
+        texts = [f"{r['heading']}\n{r['body']}".strip() for r in batch]
+        try:
+            vectors = backend.encode(texts)
+        except Exception:
+            # An embedding failure must never lose the note that was written.
+            break
+        with store.write():
+            for row, vector in zip(batch, vectors):
+                store.store_vector(int(row["id"]), vector)
+                done += 1
+    return done
+
+
+def index_path(config: Config, store: Store, path: Path, *, force: bool = False) -> IndexReport:
+    """Index exactly one note.
+
+    This is what the write tools use. They already know which file changed, so
+    rescanning the vault to rediscover it made every ``memory_learn`` cost a
+    full directory walk plus a read and a hash of every note in the vault -
+    work proportional to the whole collection for a change to one file, paid
+    on every single entry. A large vault made recording a lesson slower than
+    the lesson was worth.
+    """
+    report = IndexReport()
+    try:
+        rel = str(path.relative_to(config.vault))
+    except ValueError:
+        return report
+    if not is_indexable(rel, include=config.include, exclude=config.exclude):
+        return report
+    report.scanned = 1
+    if not path.exists():
+        store.delete_note(rel)
+        report.removed = 1
+        return report
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return report
+    digest = digest_of(text)
+    previous = store.note_digest(rel)
+    if previous == digest and not force:
+        report.unchanged = 1
+        return report
+    _write_note(config, store, path, rel, text, digest)
+    if previous is None:
+        report.added = 1
+    else:
+        report.updated = 1
+    return report
+
+
+def reindex(config: Config, store: Store, *, force: bool = False) -> IndexReport:
+    """Bring the whole index in line with the vault.
+
+    Two filters, cheapest first. An unchanged mtime skips the file without
+    opening it, which is what keeps a startup scan of a large vault fast. When
+    the mtime does differ the content digest still decides, so rewriting a file
+    with identical contents costs a read but no reindexing - and the mtime is
+    recorded anyway so the cheap check works next time.
     """
     report = IndexReport()
     if not config.vault.exists():
         return report
 
+    known = store.note_fingerprints()
     seen: set[str] = set()
     for path in iter_markdown(config):
         rel = str(path.relative_to(config.vault))
         seen.add(rel)
         report.scanned += 1
+        previous = known.get(rel)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if previous is not None and not force and previous[0] == mtime:
+            report.unchanged += 1
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         digest = digest_of(text)
-        previous = store.note_digest(rel)
-        if previous == digest and not force:
+        if previous is not None and previous[1] == digest and not force:
+            store.touch_note(rel, mtime)
             report.unchanged += 1
             continue
 
-        note = parse_note(path, text)
-        chunks = chunk_markdown(
-            note.body,
-            max_tokens=config.chunk_tokens,
-            overlap=config.chunk_overlap,
-        )
-        if not chunks:
-            chunks = [("", note.title, estimate_tokens(note.title))]
-        store.upsert_note(
-            path=rel,
-            title=note.title,
-            tags=note.tags,
-            project=project_of(rel, {"project": note.project}),
-            mtime=path.stat().st_mtime,
-            digest=digest,
-            chunks=chunks,
-            links=note.links,
-        )
+        _write_note(config, store, path, rel, text, digest)
         if previous is None:
             report.added += 1
         else:

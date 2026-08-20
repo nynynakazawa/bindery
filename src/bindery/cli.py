@@ -106,18 +106,9 @@ def _embed_missing(config: Config, store: Store) -> int:
             file=sys.stderr,
         )
         return 0
-    rows = list(store.iter_chunks_without_vectors())
-    if not rows:
-        return 0
-    batch_size = 32
-    done = 0
-    for start in range(0, len(rows), batch_size):
-        batch = rows[start : start + batch_size]
-        texts = [f"{r['heading']}\n{r['body']}".strip() for r in batch]
-        for row, vector in zip(batch, backend.encode(texts)):
-            store.store_vector(int(row["id"]), vector)
-            done += 1
-        store.commit()
+    from .indexer import refresh_embeddings
+
+    done = refresh_embeddings(config, store)
     return done
 
 

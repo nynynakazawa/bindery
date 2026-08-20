@@ -138,11 +138,15 @@ class Store:
         # up front, so the second writer waits its turn and then proceeds.
         self.conn = sqlite3.connect(db_path, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        # WAL plus a busy timeout is what lets Claude Code and Codex hold the
-        # same index open at once without either of them erroring out.
+        # busy_timeout FIRST. Switching journal modes needs a brief exclusive
+        # lock, and with several agents starting at once one of them will find
+        # the database held by another. Set after journal_mode, the timeout is
+        # still zero at the moment it is needed, and the loser crashes on
+        # startup with "database is locked" rather than waiting a few
+        # milliseconds for its turn.
         self.conn.execute("PRAGMA busy_timeout=15000")
+        self._enable_wal()
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self._depth = 0
         self._migrate()
         # Outside a transaction on purpose: sqlite3.executescript() issues an
@@ -152,6 +156,25 @@ class Store:
         self.conn.executescript(_SCHEMA)
         with self.write():
             self.set_meta("schema_version", str(SCHEMA_VERSION))
+
+    def _enable_wal(self) -> None:
+        """Turn on WAL, tolerating the race between simultaneous first opens.
+
+        WAL is what lets Claude Code and Codex hold the same index open at
+        once, so this is worth retrying rather than failing on. Some SQLite
+        builds bypass the busy handler for this pragma entirely, which is why
+        the belt-and-braces loop exists on top of the timeout.
+        """
+        import time
+
+        for attempt in range(10):
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def _migrate(self) -> None:
         """Drop derived tables when their shape changed, keeping what is learned.
@@ -230,6 +253,45 @@ class Store:
     def note_digest(self, path: str) -> str | None:
         row = self.conn.execute("SELECT digest FROM notes WHERE path=?", (path,)).fetchone()
         return row["digest"] if row else None
+
+    def note_fingerprints(self) -> dict[str, tuple[float, str]]:
+        """Every indexed note's ``(mtime, digest)``, fetched in one query."""
+        return {
+            r["path"]: (float(r["mtime"]), r["digest"])
+            for r in self.conn.execute("SELECT path, mtime, digest FROM notes")
+        }
+
+    def touch_note(self, path: str, mtime: float) -> None:
+        """Record a new mtime for a note whose contents did not change.
+
+        Without this, a file that is rewritten with identical contents fails
+        the mtime check on every future scan and is read and hashed forever.
+        """
+        with self.write():
+            self.conn.execute("UPDATE notes SET mtime=? WHERE path=?", (mtime, path))
+
+    def chunk_ids_for(self, path: str) -> list[int]:
+        return [
+            int(r["id"])
+            for r in self.conn.execute(
+                "SELECT c.id FROM chunks c JOIN notes n ON n.id = c.note_id "
+                "WHERE n.path=? ORDER BY c.seq",
+                (path,),
+            )
+        ]
+
+    def chunks_missing_vectors(self, chunk_ids: list[int] | None = None):
+        if chunk_ids is None:
+            return self.iter_chunks_without_vectors()
+        if not chunk_ids:
+            return []
+        marks = ",".join("?" * len(chunk_ids))
+        return self.conn.execute(
+            f"SELECT c.id, c.heading, c.body FROM chunks c "
+            f"LEFT JOIN vectors v ON v.chunk_id = c.id "
+            f"WHERE v.chunk_id IS NULL AND c.id IN ({marks})",
+            chunk_ids,
+        ).fetchall()
 
     def all_paths(self) -> set[str]:
         return {r["path"] for r in self.conn.execute("SELECT path FROM notes")}
