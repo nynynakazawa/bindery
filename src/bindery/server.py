@@ -436,6 +436,7 @@ class MemoryServer:
                 "default_max_tokens": self.config.max_tokens,
                 "semantic_search": backend.name if backend else "off (keyword only)",
                 "embedded_passages": stats["vectors"],
+                "vector_index": "sqlite-vec" if self.store.ann_enabled else "exact scan",
                 "project": self.config.project or "(none - every search is global)",
                 "projects_indexed": dict(self.store.projects()),
                 "indexed_only": self.config.include or "(whole vault)",

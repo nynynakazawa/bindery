@@ -165,6 +165,8 @@ class Store:
         self._enable_wal()
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._depth = 0
+        self._vec_dim: int | None = None
+        self._vec = self._load_vector_extension()
         self._migrate()
         # Outside a transaction on purpose: sqlite3.executescript() issues an
         # implicit COMMIT before it runs, which would silently close one we
@@ -194,6 +196,64 @@ class Store:
         for column, spec in self._USAGE_COLUMNS.items():
             if column not in existing:
                 self.conn.execute(f"ALTER TABLE usage ADD COLUMN {column} {spec}")
+
+    def _load_vector_extension(self) -> bool:
+        """Load sqlite-vec if it is installed and this build allows it.
+
+        Optional twice over: the package ships with the semantic extra, and
+        loading extensions is compiled out of some Python builds. Neither is
+        an error - brute force over the same vectors still answers the same
+        query, just linearly.
+        """
+        try:
+            import sqlite_vec  # type: ignore[import-not-found]
+        except ImportError:
+            return False
+        try:
+            self.conn.enable_load_extension(True)
+        except (AttributeError, sqlite3.OperationalError):
+            return False
+        try:
+            sqlite_vec.load(self.conn)
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                self.conn.enable_load_extension(False)
+            except (AttributeError, sqlite3.OperationalError):
+                pass
+
+    def _ensure_vec_table(self, dim: int) -> bool:
+        """Create the ANN index on first use, once the dimension is known.
+
+        The dimension is a property of whichever embedding backend is
+        installed, so it cannot be part of the static schema. A mismatch means
+        the backend changed; the index is rebuilt rather than reconciled,
+        since it is derived from vectors this database already holds.
+        """
+        if not self._vec:
+            return False
+        if self._vec_dim == dim:
+            return True
+        try:
+            stored = self.get_meta("vector_dim")
+            if stored and int(stored) != dim:
+                self.conn.execute("DROP TABLE IF EXISTS vec_chunks")
+            self.conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING "
+                f"vec0(chunk_id INTEGER PRIMARY KEY, embedding float[{dim}])"
+            )
+            self.set_meta("vector_dim", str(dim))
+        except sqlite3.DatabaseError:
+            self._vec = False
+            return False
+        self._vec_dim = dim
+        return True
+
+    @property
+    def ann_enabled(self) -> bool:
+        return bool(self._vec)
 
     def _enable_wal(self) -> None:
         """Turn on WAL, tolerating the race between simultaneous first opens.
@@ -352,6 +412,12 @@ class Store:
         ids = [r["id"] for r in self.conn.execute("SELECT id FROM chunks WHERE note_id=?", (note_id,))]
         for chunk_id in ids:
             self.conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (chunk_id,))
+        if self._vec and self._vec_dim is not None:
+            self.conn.execute(
+                "DELETE FROM vec_chunks WHERE chunk_id IN "
+                "(SELECT id FROM chunks WHERE note_id=?)",
+                (note_id,),
+            )
         self.conn.execute("DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE note_id=?)", (note_id,))
         self.conn.execute("DELETE FROM chunks WHERE note_id=?", (note_id,))
 
@@ -461,11 +527,59 @@ class Store:
         ).fetchall()
 
     def store_vector(self, chunk_id: int, values: list[float]) -> None:
+        blob = pack_vector(values)
         self.conn.execute(
             "INSERT INTO vectors(chunk_id, dim, vec) VALUES(?,?,?) "
             "ON CONFLICT(chunk_id) DO UPDATE SET dim=excluded.dim, vec=excluded.vec",
-            (chunk_id, len(values), pack_vector(values)),
+            (chunk_id, len(values), blob),
         )
+        # `vectors` stays the canonical copy: the ANN index is derived from it
+        # and can be dropped and rebuilt, which is what makes switching
+        # embedding backends - or losing the extension - a non-event.
+        if self._ensure_vec_table(len(values)):
+            try:
+                self.conn.execute("DELETE FROM vec_chunks WHERE chunk_id=?", (chunk_id,))
+                self.conn.execute(
+                    "INSERT INTO vec_chunks(chunk_id, embedding) VALUES(?,?)",
+                    (chunk_id, blob),
+                )
+            except sqlite3.DatabaseError:
+                self._vec = False
+
+    def nearest_vectors(self, query: list[float], limit: int) -> list[int] | None:
+        """Approximate nearest neighbours, or ``None`` if unavailable.
+
+        Returning ``None`` rather than an empty list matters: no index and no
+        matches are different answers, and the caller falls back to the exact
+        scan only for the first.
+        """
+        if not self._ensure_vec_table(len(query)):
+            return None
+        try:
+            rows = self.conn.execute(
+                "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ? "
+                "AND k = ? ORDER BY distance",
+                (pack_vector(query), limit),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return None
+        return [int(r["chunk_id"]) for r in rows]
+
+    def rebuild_vector_index(self) -> int:
+        """Populate the ANN index from the vectors already stored."""
+        rows = self.conn.execute("SELECT chunk_id, dim, vec FROM vectors").fetchall()
+        if not rows or not self._ensure_vec_table(int(rows[0]["dim"])):
+            return 0
+        done = 0
+        with self.write():
+            self.conn.execute("DELETE FROM vec_chunks")
+            for row in rows:
+                self.conn.execute(
+                    "INSERT INTO vec_chunks(chunk_id, embedding) VALUES(?,?)",
+                    (int(row["chunk_id"]), row["vec"]),
+                )
+                done += 1
+        return done
 
     def all_vectors(self, scope_sql: str = "", scope_params: list | None = None):
         return self.conn.execute(
@@ -475,6 +589,22 @@ class Store:
             f"WHERE 1=1 {scope_sql}",
             scope_params or [],
         ).fetchall()
+
+    def filter_chunks_in_scope(
+        self, chunk_ids: list[int], scope_sql: str, scope_params: list | None = None
+    ) -> list[int]:
+        """Keep only the ids inside the scope, preserving the given order."""
+        if not chunk_ids or not scope_sql:
+            return chunk_ids
+        marks = ",".join("?" * len(chunk_ids))
+        rows = self.conn.execute(
+            f"""SELECT chunks.id FROM chunks
+                JOIN notes ON notes.id = chunks.note_id
+                WHERE chunks.id IN ({marks}) {scope_sql}""",
+            [*chunk_ids, *(scope_params or [])],
+        ).fetchall()
+        allowed = {int(r["id"]) for r in rows}
+        return [chunk_id for chunk_id in chunk_ids if chunk_id in allowed]
 
     def projects(self) -> list[tuple[str, int]]:
         """Every project the vault knows about, with note counts."""

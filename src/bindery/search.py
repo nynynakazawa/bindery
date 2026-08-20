@@ -241,18 +241,33 @@ def _keyword_rankings(
     return rankings
 
 
+#: How far past the requested depth to look when the ANN index does the
+#: search. Nearest-neighbour queries cannot express "and only this project",
+#: so the filter is applied afterwards and the over-fetch is what stops a
+#: scoped search from coming back short.
+ANN_OVERFETCH = 8
+
+
 def _semantic_ranking(
     store: Store, query: str, depth: int, scope_sql: str = "", scope_params: list | None = None
 ) -> list[int]:
     backend = load_backend()
     if backend is None:
         return []
-    rows = store.all_vectors(scope_sql, scope_params)
-    if not rows:
-        return []
     try:
         query_vec = backend.encode([query])[0]
     except Exception:
+        return []
+
+    approximate = store.nearest_vectors(query_vec, depth * ANN_OVERFETCH)
+    if approximate is not None:
+        return store.filter_chunks_in_scope(approximate, scope_sql, scope_params)[:depth]
+
+    # No ANN index: compare against every vector. Correct, and linear in the
+    # size of the vault - fine for a personal collection, and the reason the
+    # index above is worth having when it is available.
+    rows = store.all_vectors(scope_sql, scope_params)
+    if not rows:
         return []
     scored = [
         (int(r["chunk_id"]), cosine(query_vec, unpack_vector(r["vec"], int(r["dim"]))))

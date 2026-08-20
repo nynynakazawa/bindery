@@ -89,6 +89,11 @@ def cmd_index(args: argparse.Namespace) -> int:
     if args.embed:
         count = _embed_missing(config, store)
         print(f"embedded {count} passage(s)")
+        # Catches the case where sqlite-vec was installed after the vectors
+        # were: they are all in `vectors`, and the ANN index has never seen
+        # them. Cheap when it is already in step.
+        if store.ann_enabled:
+            print(f"nearest-neighbour index: {store.rebuild_vector_index()} vector(s)")
     print(json.dumps(report.as_dict(), indent=2))
     store.close()
     return 0
@@ -176,6 +181,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  embedded       {stats['vectors']}")
     print(f"  max tokens     {config.max_tokens}")
     print(f"  semantic       {backend.name if backend else 'off (keyword only)'}")
+    if backend:
+        print(f"  vector index   {'sqlite-vec' if store.ann_enabled else 'exact scan'}")
     if problems:
         print("\nissues:")
         for problem in problems:
