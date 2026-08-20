@@ -1,156 +1,169 @@
 # Bindery
 
-**Claude Code と Codex で、ひとつの記憶を共有する。**
+**One shared memory for Claude Code and Codex.**
 
-[English README](README.md)
+[日本語版 README](README.ja.md)
 
-Bindery は、コーディングエージェントに永続的な共有知識ベースを与える
-[MCP](https://modelcontextprotocol.io) サーバーです。しかも**使うほど賢くなります**。
-Claude Code が書き残した判断を、次のセッションの Codex が見つけられます。
-検索は自分自身から学習し、答え続けているノートは上位に、意味を失ったノートは
-静かに沈みます。ノートはディスク上の素の Markdown のままなので、Obsidian も
-`grep` も `git` もそのまま使えます。
-
----
-
-## なぜ作ったか
-
-だいたいこの順で人がぶつかる、3つの問題があります。
-
-**毎回ゼロから始まる。** アーキテクチャを説明し直し、すでに下した判断を伝え直し、
-すでに試して却下した2案をまた説明する。この再説明は純粋なトークンコストで、
-新しいターミナルを開くたびに支払わされます。
-
-**ノートのフォルダをエージェントに渡すだけでは破綻する。** Vault が大きくなると
-読み込みは遅くなり、かといって一部だけ読ませようとすると「どの一部か」を人間が
-当てる羽目になります。ある規模を超えると、エージェントはコンテキストを使い切るか、
-見当違いのファイルを読むかのどちらかになります。
-
-**エージェントが2つあれば記憶も2つになる。** Claude Code と Codex はそれぞれ
-独自のメモリ（`CLAUDE.md`、`AGENTS.md`、Codex Memories）を持ちますが、
-どれも相手には渡りません。片方での作業は、もう片方からは存在しないのと同じです。
-
-**溜めるだけの記憶は書類棚にすぎない。** ノートは積み上がる一方で統合されず、
-どれが役に立っているのかも、何が足りていないのかも分からなくなります。
-
-Bindery はこの3つに、ひとつの考え方で答えます。
-**Markdown は残したまま、読み込み方だけを差し替える。**
-ノートはファイルのまま。読み込みは、共有インデックスから該当箇所だけを
-トークン上限つきで返す検索になります。
+Bindery is an [MCP](https://modelcontextprotocol.io) server that gives your
+coding agents a single, persistent knowledge base that **gets better as you use
+it**. Claude Code writes a decision down; Codex finds it in the next session.
+Retrieval learns from itself, so the notes that keep answering questions rise and
+the ones that stopped mattering fade. Your notes stay as plain Markdown on disk,
+so Obsidian, `grep`, and `git` all keep working.
 
 ---
 
-## できること
+## Why this exists
 
-- **エージェント間で共有される。** 両クライアントが同じ Vault を指せば、
-  同じインデックスを見ます。片方が書いたノートは、もう片方からすぐ検索できます。
-- **ファイル単位ではなく箇所単位で返す。** ノートは Markdown の見出しで分割され、
-  ヒットした節だけが返ります。文書全体は返りません。
-- **トークン上限が効く。** 検索応答には必ず上限（既定 2,000 トークン）がかかります。
-  入り切らなかったヒットは落とされ、そのことが応答に明記されるので、
-  「ヒットしなかった」のか「多すぎて入らなかった」のかを区別できます。
-- **日本語と英語が最初から動く。** 全文検索は SQLite FTS5 の `trigram` トークナイザを
-  使うため、形態素解析器なしで日本語を索引できます。2文字クエリ（`認証`、`設計`）は
-  trigram では原理的に表現できないため、部分一致検索に自動でフォールバックします。
-- **Obsidian 互換。** `[[wiki リンク]]` がそのままグラフになります。Vault は
-  Markdown ファイルとしてのみ読み書きされます。
-- **勝手に育つ。** 検索そのものが学習信号です。質問に答えたノートは順位が上がり、
-  役に立たなくなったノートは減衰し、0件だったクエリは**エージェント自身の言葉のまま**
-  知識ギャップとして記録されます。モデル呼び出しも設定も手入れも不要です。
-- **ジャーナルに書き、育ったら昇格させる。** `memory_learn` はその日のジャーナルに
-  学びを追記します。同じ話題が十分な日数にわたって再登場したら、独立したノートに
-  すべき候補として提示されます。
-- **セッション記録の自動生成。** クライアントが切断したとき、サーバーは自分が
-  観測した事実（空振りした質問、触れたノート）を自動で書き残します。
-  モデル呼び出しも、エージェントの協力も不要です。
-- **成長が散らかりにならないよう統合する。** ほぼ重複したパッセージと、
-  一度も引かれていないノートを自動検出し、`memory_review` が報告します。
-- **セマンティック検索は任意。** 追加インストールすると、キーワードとベクトルの
-  ハイブリッド検索が有効になります。任意なのは、キーワード検索だけでも成立するからです。
-- **必須依存パッケージはゼロ。** Python 標準ライブラリのみ。これは重要で、
-  このサーバーは異なる2つのエージェント環境の中で確実に起動する必要があります。
+Three problems, in the order people usually hit them.
 
-## あえて作らなかったもの
+**Every session starts from zero.** You re-explain the architecture, the
+decisions you already made, and the two approaches you already rejected. That
+re-explanation is pure token cost, paid again on every new terminal.
 
-ツール面とインストールを小さく保つため、意図的に落としました。
+**Pointing an agent at a note folder does not scale.** Once a vault is large,
+loading it is slow, and loading *part* of it means guessing which part. Past a
+certain size the agent either runs out of context or reads the wrong files.
 
-| 落とした機能 | 理由 |
+**Two agents means two memories.** Claude Code and Codex each have their own
+native memory (`CLAUDE.md`, `AGENTS.md`, Codex Memories). None of it crosses
+over. Work done in one is invisible to the other.
+
+**A memory that only stores is a filing cabinet.** Notes pile up, nothing is ever
+consolidated, and nobody can tell which ones are earning their keep or what the
+collection is missing.
+
+Bindery answers all three with one idea: **keep the Markdown, replace the
+loading.** Notes stay files. Retrieval becomes a search that returns matching
+passages under a hard token budget, from an index both agents share.
+
+---
+
+## What it does
+
+- **Shared across agents.** Both clients point at the same vault and therefore
+  the same index. A note written by one is searchable by the other immediately.
+- **Passage retrieval, not file loading.** Notes are split at Markdown headings.
+  A match returns that section, not the whole document.
+- **A hard token budget.** Every search response is capped (2,000 tokens by
+  default). When matches do not fit, they are dropped and the response says so,
+  so you can tell "nothing matched" from "too much matched".
+- **Japanese and English out of the box.** Full-text search uses SQLite FTS5
+  with the `trigram` tokenizer, which indexes CJK without a morphological
+  analyser. Two-character queries (`認証`, `設計`) fall back to a substring scan,
+  because trigram cannot represent them.
+- **Obsidian-compatible.** `[[wiki links]]` become a navigable graph. The vault
+  is only ever read and written as Markdown files.
+- **It grows on its own.** Every search is a training signal. Notes that answer
+  questions get ranked higher; notes that stopped being useful decay back down;
+  questions that returned nothing are logged as knowledge gaps in the agents' own
+  words. No model calls, no configuration, no curation required.
+- **Journal, then graduate.** `memory_learn` appends what an agent learned to a
+  daily journal. When a topic recurs across enough days, it is surfaced as ready
+  to become a durable note of its own.
+- **Automatic session records.** When a client disconnects, the server writes
+  down what it observed by itself - the questions that came back empty, the
+  notes that were touched. No model call, no agent cooperation required.
+- **Consolidation, so growth does not become sprawl.** Near-duplicate passages and
+  never-retrieved notes are detected automatically and reported by
+  `memory_review`.
+- **Optional semantic search.** Install one extra and hybrid keyword + vector
+  retrieval turns on. It is optional because keyword search alone already works.
+- **Zero required dependencies.** Python standard library only. This matters:
+  the server has to start reliably inside two different agent runtimes.
+
+## What it deliberately does not do
+
+Cut on purpose, to keep the tool surface and the install small:
+
+| Omitted | Why |
 | --- | --- |
-| クラウド同期、チームワークスペース | ローカルファースト。ノートはあなたのファイルです。 |
-| アカウント、認証、マルチテナント | 個人用ツールだからです。 |
-| LLM によるメモリ抽出 | 書き込みのたびに課金 API を呼ぶことになり、目的と正反対です。 |
-| コードベース全体の AST 索引 | 別の問題です。必要ならコード解析サーバーを併用してください。 |
-| ダッシュボード、Web UI | エディタが UI です。 |
-| ノートの自動マージ・自動削除 | 重複と陳腐化は自動で**検出**しますが、実際に手を入れるには判断が要ります。黙ってノートを書き換えるのは、メモリ層が守るべきものを自ら壊す典型的なやり方です。 |
-| 推論トレース、formation metrics | 増えるトークンコストに見合う価値が確認できていません。 |
+| Cloud sync, team workspaces | Local-first. Your notes are your files. |
+| Accounts, auth, multi-tenancy | Single-user tool. |
+| LLM-based memory extraction | It would call a paid API on every write - the opposite of the goal. |
+| Whole-codebase AST indexing | A different problem. Use a code-intelligence server alongside this. |
+| Dashboards, web UI | Your editor is the UI. |
+| Automatic merging or deletion of notes | Duplicates and stale notes are *detected* automatically, but acting on them needs judgment. Silently rewriting your notes is how a memory layer destroys what it was meant to protect. |
+| Reasoning traces, formation metrics | Unproven value for the token cost they add. |
 
-ツールは **8個** です。この数字は事故ではなく設計判断です。ツールのスキーマは
-セッションごとにモデルへ送られるため、**一度も呼ばれなくても常時トークンを消費します**。
-テストで個数を固定しているので、増やすときは意図的な判断になります。
+The tool surface is **eight tools**. That number is a design decision, not an
+accident: tool schemas are sent to the model on every session, so every tool has
+a standing token cost whether or not it is ever called. A test asserts the count,
+so raising it is a deliberate act.
 
 ---
 
-## インストール
+## Install
 
-Python 3.11 以上が必要です。
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (`brew install uv`).
 
 ```bash
-git clone <this-repo> bindery && cd bindery
-pip install -e .
+git clone https://github.com/nynynakazawa/bindery.git && cd bindery
+uv tool install .
 ```
 
-セマンティック検索（任意。ローカル埋め込みモデル約 100MB を追加。API 呼び出しは
-一切なく、クエリごとの課金も発生しません）:
+That puts `bindery` on your PATH in its own isolated environment. `pipx install .`
+does the same if you already use pipx.
+
+Prefer these over `pip install -e .`. A bare `pip install` fails outright on a
+Homebrew or system Python ([PEP 668](https://peps.python.org/pep-0668/)), and
+inside a project `.venv` the `bindery` command exists only while that venv is
+activated - which it is not when an agent launches the server. Use `pip` only
+inside a virtualenv you manage yourself, and expect to point your agents at the
+full path.
+
+Optional semantic search (adds a local embedding model, roughly 100 MB, no API
+calls and no per-query cost):
 
 ```bash
-pip install -e '.[semantic]'
+uv tool install '.[semantic]'
 bindery index --embed
 ```
 
-## セットアップ
+## Set up
 
-**`setup --write` を使ってください。** これが推奨手順であり、全工程を完了させる
-唯一の方法です。索引の作成、検出した全エージェントの設定、そして
-**これが無いと何も記録されない**指示文の導入まで、まとめて行います。
+**Use `setup --write`.** It is the recommended path and the only one that
+completes every step - indexing the vault, configuring every agent it finds, and
+installing the agent instructions without which nothing is ever recorded.
 
 ```bash
-export BINDERY_VAULT="$HOME/Obsidian/MyVault"   # 既存の Obsidian Vault をそのまま指定できます
+export BINDERY_VAULT="$HOME/Obsidian/MyVault"   # an existing Obsidian vault works as-is
 
-bindery setup            # プレビュー: 触るファイルを全部列挙するだけ
-bindery setup --write    # 実行
-bindery status           # 確認
+bindery setup            # preview: lists every file it would touch
+bindery setup --write    # do it
+bindery status           # confirm
 ```
 
-インストールはこれで完了です。
+That is the whole installation.
 
-**既定が実行ではなくプレビューなのは意図的です。** 最後の手順がホームディレクトリの
-エージェントポリシーファイルに追記するためで、これらはたいてい長く、手で管理されて
-いるものです。何かに編集される前に一度目を通す価値があります。既存ファイルは
-バックアップを取ったうえで追記し、置き換えることはありません。再実行しても
-何も変わりません。
+`setup` previews by default rather than acting, because its last step appends to
+the agent policy files in your home directory - long, hand-maintained files worth
+looking at before something edits them. Existing files are backed up, never
+replaced, and re-running changes nothing.
 
 <details>
-<summary>手動で行う場合</summary>
+<summary>Doing it by hand instead</summary>
 
-以降のコマンドは `setup --write` が内部で実行しているものです。個別に実行したい
-場合（スコープを変える、片方のエージェントだけ設定する、指示文を任意の場所に貼る）に
-使ってください。そうでなければ[ツール一覧](#ツール一覧)まで読み飛ばして構いません。
+The individual commands below are what `setup --write` runs for you. Reach for
+them when you want one piece on its own - a different scope, one agent only, or
+the instruction block pasted somewhere of your choosing. Otherwise skip to
+[Tools](#tools).
 
 </details>
 
-## エージェントに繋ぐ
+## Connect your agents
 
-**どちらのエージェントも主ではありません。** 引数なしの `install` は対応する
-全クライアントの設定を出力し、どれが検出できたかも表示します。
+Neither agent is the primary one. `install` with no argument emits the
+configuration for every supported client and tells you which it can see:
 
 ```bash
-bindery install              # 全クライアント分を表示
-bindery install --write      # 実際に書き込む（先にバックアップを取り、
-                                  # 既存の他サーバー設定は壊しません）
-bindery install codex        # 片方だけにすることも可能
+bindery install              # print config for all clients
+bindery install --write      # apply it (backs up first, never clobbers
+                                  # servers you already configured)
+bindery install codex        # or just one
 ```
 
-出力される2形式:
+For reference, the two forms it produces:
 
 ```jsonc
 // Claude Code - .mcp.json
@@ -169,203 +182,209 @@ args = ["serve"]
 BINDERY_VAULT = "/Users/you/Obsidian/MyVault"
 ```
 
-**すべてのクライアントで `BINDERY_VAULT` を同じ値にしてください。**
-インデックスの場所はこの値から導出されるため、ここが揃っていることが
-「記憶が共有される」ことの条件そのものです。
+**Point every client at the same `BINDERY_VAULT`.** That single shared value
+is what makes the memory shared - the index location is derived from it.
 
-## エージェントに使い方を教える
+## Teach the agents to use it
 
-**この手順は省略できません。** そして、たいてい省略されます。
+This step is not optional, and it is the one people skip.
 
-MCP サーバーは呼ばれたら答えることしかできません。**エージェントに何かを
-記録させることは原理的にできない**ので、エージェントが自分で書こうと判断
-しない限り何も残りません。その判断を作るのがこの指示文です。
+An MCP server can only answer calls. It cannot make an agent record anything,
+so nothing is written unless the agent decides to write it. These instructions
+are that decision:
 
 ```bash
-bindery prompt --global --write   # ~/.claude/CLAUDE.md と ~/.codex/AGENTS.md
-bindery prompt --write            # このプロジェクトの CLAUDE.md / AGENTS.md のみ
-bindery prompt                    # 表示だけして好きな場所に貼る
+bindery prompt --global --write   # ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md
+bindery prompt --write            # or just this project's CLAUDE.md / AGENTS.md
+bindery prompt                    # or print, and paste where you like
 ```
 
-**`--global` を推奨します。** Vault を全プロジェクトで共有するなら、指示文も
-全プロジェクトで共有されている必要があります。プロジェクト単位で入れると
-チェックアウトのたびに実行が必要になり、大半で忘れます。そして
-**指示を受けていないエージェントは何も記録しません**。
+Prefer `--global`. A vault shared across projects needs instructions that are
+shared across projects too; installing per project means repeating the step in
+every checkout and forgetting it in most of them, and an agent that was never
+told to record anything records nothing.
 
-指示文はクライアント中立で、両ファイルで同一の内容です。
+The block is client-neutral and identical in both files.
 
-なお `install` はこの手順を**実行しません**。サーバーを設定することと、
-エージェントに使い方を教えることは別の作業であり、何かが記録されるかどうかを
-決めるのは後者だけです。
+Note that `install` does **not** do this step. Configuring the server and
+teaching the agents to use it are separate things, and only the second one
+determines whether anything is ever written down.
 
 ---
 
-## ツール一覧
+## Tools
 
-| ツール | 用途 |
+| Tool | Purpose |
 | --- | --- |
-| `memory_search` | 検索し、トークン上限内で該当箇所を返す。 |
-| `memory_read` | ノート1件を全文で読む。上限で切り詰められる。 |
-| `memory_write` | ノートを作成・上書きし、即座に索引する。 |
-| `memory_learn` | このセッションで学んだことをその日のジャーナルに記録する。 |
-| `memory_review` | ギャップ、主力ノート、重複、陳腐化、昇格候補を報告する。 |
-| `memory_links` | ノートの `[[wiki リンク]]` の発リンクと被リンク。 |
-| `memory_status` | Vault のパス、インデックス規模、セマンティック検索の状態。 |
-| `memory_reindex` | 外部で編集した後に Vault を再スキャンする。 |
+| `memory_search` | Search and return matching passages under a token budget. |
+| `memory_read` | Read one note in full, truncated at the budget. |
+| `memory_write` | Create or overwrite a note and index it immediately. |
+| `memory_learn` | Record what this session learned into today's journal. |
+| `memory_review` | Gaps, load-bearing notes, duplicates, stale notes, promotion candidates. |
+| `memory_links` | Outgoing and incoming `[[wiki links]]` for a note. |
+| `memory_status` | Vault path, index size, semantic search state. |
+| `memory_reindex` | Rescan the vault after external edits. |
 
-`CLAUDE.md` と `AGENTS.md` に書いておくと効く指示:
+A prompt that works well in `CLAUDE.md` and `AGENTS.md`:
 
-> 作業を始める前に `memory_search` で過去の関連判断を検索すること。
-> 次のセッションが調べ直す羽目になること（決定、制約、行き止まり、効いた修正）を
-> 学んだら、その都度 `memory_learn` で話題タグ付きで記録すること。
-> 恒久的な参照ノートには `memory_write` を使うこと。
+> Before starting work, call `memory_search` for relevant prior decisions.
+> Whenever you learn something the next session would otherwise have to
+> rediscover - a decision, a constraint, a dead end, a fix that worked - record
+> it with `memory_learn` and tag the topic.
+> Use `memory_write` for durable reference notes.
 
-ループを閉じるのは `memory_learn` です。検索だけでも「何が重要か」は学習されますが、
-**知識が増えるのは書いたときだけ**です。そして **`memory_learn` が自動で呼ばれることは
-ありません**。発火の閾値も存在しません。MCP サーバーは何も起動できないからです。
-`bindery prompt` が入れる指示文が唯一の仕組みであり、見た目以上に重要な理由が
-ここにあります。
+`memory_learn` is what closes the loop. Searching alone teaches the ranking what
+matters, but only writing adds knowledge - and **`memory_learn` is never called
+automatically**. No threshold triggers it; MCP servers cannot initiate anything.
+The instructions installed by `bindery prompt` are the entire mechanism,
+which is why that step matters more than it looks.
 
-**自動なのは**後述のセッション記録のほうですが、これが捉えるのは活動であって
-洞察ではありません。
+What *is* automatic is the session record described below - but it captures
+activity, not insight.
 
 ## CLI
 
 ```bash
-bindery serve                    # stdio の MCP サーバー（エージェントが起動する）
+bindery serve                    # MCP server on stdio (what agents launch)
 bindery index [--force] [--embed]
 bindery search "認証方式" [--limit N] [--max-tokens N] [--json]
-bindery status                   # 問題があれば非ゼロ終了
-bindery setup [--write]          # 以下をまとめて実行
+bindery status                   # exits non-zero when something is wrong
+bindery setup [--write]          # everything below, in one pass
 bindery review [--json] [--min-count N]
 bindery install [claude|codex] [--write]
 bindery prompt [--write] [--global]
 ```
 
-数週間に一度回すべきなのは `review` です。「エージェントが何度も聞いたのに
-書いていなかったこと」「実際に働いているノート」「散らかり始めたもの」が分かります。
+`review` is the one to run every few weeks. It answers: what did the agents keep
+asking that I never wrote down, which notes are doing the work, and what has
+turned into clutter.
 
-## 設定
+## Configuration
 
-| 環境変数 | 既定値 | 意味 |
+| Variable | Default | Meaning |
 | --- | --- | --- |
-| `BINDERY_VAULT` | `./memory` | Markdown ノートのディレクトリ。 |
-| `BINDERY_STATE_DIR` | `~/.bindery` | インデックスの保存先。 |
-| `BINDERY_MAX_TOKENS` | `2000` | 検索応答の既定上限。 |
-| `BINDERY_LIMIT` | `8` | 1検索あたりの既定件数。 |
-| `BINDERY_CHUNK_TOKENS` | `400` | 分割後の1箇所の目標サイズ。 |
-| `BINDERY_SEMANTIC` | 有効 | `0` にするとキーワード検索のみ。 |
-| `BINDERY_AUTOCAPTURE` | 有効 | `0` にするとセッション記録を書きません。 |
+| `BINDERY_VAULT` | `./memory` | Directory of Markdown notes. |
+| `BINDERY_STATE_DIR` | `~/.bindery` | Where the index lives. |
+| `BINDERY_MAX_TOKENS` | `2000` | Default search response cap. |
+| `BINDERY_LIMIT` | `8` | Default passages per search. |
+| `BINDERY_CHUNK_TOKENS` | `400` | Target passage size. |
+| `BINDERY_SEMANTIC` | on | Set to `0` to force keyword-only. |
+| `BINDERY_AUTOCAPTURE` | on | Set to `0` to stop writing session records. |
 
-成長まわりのチューニング値は `growth.py` に定数として置いています
-（`USAGE_HALF_LIFE_DAYS`、`USAGE_BOOST_WEIGHT`、`DUPLICATE_THRESHOLD`、
-`STALE_AFTER_DAYS`、`PROMOTION_MIN_ENTRIES`）。あえて環境変数にしていません。
-検索の挙動そのものを変える値であり、シェルの export ではなくテストを回して
-変えるべきものだからです。
+Growth tuning lives in `growth.py` as named constants - `USAGE_HALF_LIFE_DAYS`,
+`USAGE_BOOST_WEIGHT`, `DUPLICATE_THRESHOLD`, `STALE_AFTER_DAYS`,
+`PROMOTION_MIN_ENTRIES`. They are deliberately not environment variables: they
+change retrieval behaviour and should be changed with a test run, not a shell
+export.
 
 ---
 
-## 仕組み
+## How it works
 
 ```
-Obsidian / エディタ              Claude Code            Codex
+Obsidian / your editor          Claude Code            Codex
         |                            |                   |
-        | .md を編集                  |  MCP stdio        |  MCP stdio
+        | edits .md                  |  MCP stdio        |  MCP stdio
         v                            v                   v
    ┌─────────────┐            ┌──────────────────────────────┐
-   │   Vault     │  走査  ->  │   Bindery MCP サーバー   │
-   │  *.md       │            │  分割 / 索引 / 検索           │
+   │   Vault     │  scan  ->  │   Bindery MCP server    │
+   │  *.md files │            │  chunk / index / retrieve    │
    └─────────────┘            └──────────────┬───────────────┘
-     信頼できる正                              │
+   source of truth                           │
                                              v
                                  ┌───────────────────────┐
                                  │ SQLite (WAL)          │
                                  │  FTS5 trigram + BM25  │
-                                 │  ベクトル（任意）       │
+                                 │  vectors (optional)   │
                                  └───────────────────────┘
 ```
 
-**Markdown が正です。** データベースは派生インデックスにすぎません。削除しても
-再構築されますし、ノートがデータベースに閉じ込められることはありません。
+**Markdown is the source of truth.** The database is a derived index. Delete it
+and it rebuilds; your notes are never trapped inside it.
 
-**節約はチャンク分割から生まれます。** ノート全体を返す検索系は、1文が一致した
-だけで 4,000 トークンの文書をエージェントに渡してしまいます。該当する節だけを
-返すかどうかが、「元が取れるメモリ層」と「かえって高くつくメモリ層」の分かれ目です。
+**Chunking is where the savings come from.** A retrieval system that returns
+whole notes will hand an agent a 4,000-token document because one sentence
+matched. Returning the matching section instead is the difference between a
+memory layer that pays for itself and one that costs more than it saves.
 
-**2つのランキングを融合します。** trigram 索引に対する BM25 と、埋め込みを
-入れている場合はチャンクベクトルのコサイン類似度。両者は Reciprocal Rank Fusion で
-統合されます。スケールの異なる2つの指標の間で、スコアの目盛り合わせが不要になるためです。
+**Two rankings, fused.** BM25 over the trigram index, and - when embeddings are
+installed - cosine similarity over chunk vectors. They are combined with
+Reciprocal Rank Fusion, which needs no score calibration between two metrics
+living on different scales.
 
-**内容ハッシュによる差分更新。** 触っただけで編集していないファイルの再スキャンは
-コストゼロです。サーバーは起動時にも再スキャンするので、エージェントを動かして
-いない間に Obsidian で編集した内容も自動的に取り込まれます。
+**Incremental by content hash.** A file that is touched but not edited costs
+nothing to rescan. The server also rescans on startup, so edits made in Obsidian
+while no agent was running are picked up automatically.
 
-**同時実行。** SQLite を WAL モードと busy timeout で開くため、2つのエージェントが
-同時にインデックスを開いたままにできます。
+**Concurrency.** SQLite in WAL mode with a busy timeout, so both agents can hold
+the index open at once.
 
-### 成長ループ
+### The growth loop
 
 ```
-   検索 ──> 何を聞き、何が答えたか ──────────┐
-     ^                                      │
-     │                                      v
-   ランキング <── 利用重み（頻度 x 新しさ）<── テレメトリ
-     ^                                      │
-     │                                      v
-   検索品質                          review: ギャップ / 重複 /
-                                     陳腐化 / 昇格候補
+   search ──> what was asked, and what answered it ──┐
+      ^                                              │
+      │                                              v
+   ranking <── usage weight (frequency x recency) <── telemetry
+      ^                                              │
+      │                                              v
+   retrieval quality                        review: gaps, duplicates,
+                                            stale notes, promotions
 ```
 
-**学習信号は利用実績であり、しかも無料です。** 検索のたびにクエリと、それに答えた
-ノートが記録されます。ノートの重みは `log(頻度)` × 半減期30日の指数減衰です。
-対数にしてあるので1つのノートが読まれすぎて支配的になることはなく、減衰があるので
-役目を終えた知識は静かに押し上げられなくなります。ブーストは**25%が上限**です。
-履歴は同点を崩してよいが、実際の内容一致を追い越してはならないためです。
+**Usage is the training signal, and it is free.** Each search records the query
+and the notes that answered it. A note's weight is `log(frequency)` times an
+exponential recency decay with a 30-day half-life, so heavy use cannot let one
+note dominate and knowledge that stopped being useful quietly stops being
+boosted. The boost is capped at 25%: history may break ties, but it must never
+outrank an actual content match.
 
-**利用実績はチャンクIDではなくノートのパスに紐づけています。** チャンクIDは
-再インデックスのたびに振り直されるため、そちらに紐づけるとファイルを編集する
-たびに学習内容が消えてしまいます。
+**Usage is keyed by note path, not chunk id.** Chunk ids are rebuilt on every
+reindex; keying on them would erase everything the system had learned each time
+a file was edited.
 
-**空振りも記録します。** 0件だったクエリは、それを必要としたエージェント自身の
-言葉で表現された「何が足りないか」の最も明確な表明です。同じ空振りの繰り返しが
-`knowledge_gaps` になります。
+**Misses are recorded too.** A query that returns nothing is the clearest
+statement the system ever gets about what it is missing, phrased by the agent
+that wanted it. Repeats of the same miss become `knowledge_gaps`.
 
-**自動記録には閾値があり、意図的に厳しくしてあります。** クライアント切断時、
-サーバーが `journal/sessions/` に記録を書くのは、そのセッションが
-`AUTO_CAPTURE_MIN_SIGNALS`（2）以上の**シグナル**を出した場合だけです。
-シグナルとは「答えの出なかった質問」「書かれたノート」「記録された学び」であり、
-**成功した検索は数えません**。必要なものが全部見つかったセッションは、
-システムに何も教えていないからです。閾値未満のセッションは何も書きません。
-これが、日常的な参照で Vault が埋まるのを防いでいます。
+**Automatic capture has a threshold, and it is deliberately strict.** When a
+client disconnects, the server writes a record to `journal/sessions/` only if
+the session produced at least `AUTO_CAPTURE_MIN_SIGNALS` (2) *signals*. A signal
+is an unanswered question, a note written, or a learning recorded - never a
+successful search, because a session that found everything it needed taught the
+system nothing. Sessions below the threshold write nothing at all, which is what
+keeps routine lookups from filling the vault.
 
-**セッション記録は書かれますが、索引されません。** 一見矛盾ですが逆です。
-この記録には、そのセッションが**答えられなかった**質問が並びます。これを索引すると、
-「答えが無かった」という記録が、まさにその質問にヒットするようになります。結果、
-2回目に誰かが同じことを聞くとギャップが「解決済み」に見え、`memory_review` から
-静かに消えます。**一度検出したせいで壊れる**わけです。「誰も X を知らなかった」という
-ノートが、X についての答えとして引かれてはいけません。ギャップは queries テーブルで
-管理しており、Vault に何を書いても汚染されません。
+**Session records are written but never indexed.** This looks like an
+inconsistency and is the opposite. Those records list the questions a session
+could *not* answer. Index them and the record of a missing answer starts
+matching the very query it was written about, so the second time anyone asks,
+the gap looks answered and quietly disappears from `memory_review` - broken
+precisely because it had been detected once. A note saying "nobody knew X" must
+never be retrievable as an answer about X. Gaps live in the queries table, which
+nothing written into the vault can contaminate.
 
-**統合は検出までで止めます。** 重複検出は bottom-k のシングルスケッチを使い、
-Jaccard ではなく**包含率**で採点します。実務で問題になる冗長性はたいてい
-「一方が他方＋一文」という非対称な形をしており、Jaccard はこれを不当に低く見積もる
-一方、包含率は正しく「ほぼ完全な重複」と報告するからです。候補ペアはスケッチ値の
-転置索引から取るため、比較回数は二乗にはなりません。
+**Consolidation stops at detection.** Near-duplicates are found with bottom-k
+shingle sketches and scored by *containment* rather than Jaccard, because the
+redundancy that matters usually looks like one passage being another plus a
+sentence - an asymmetry Jaccard punishes and containment reports correctly.
+Candidate pairs come from an inverted index over sketch values, which keeps the
+comparison well clear of quadratic.
 
-## テスト
+## Tests
 
 ```bash
 pip install -e '.[dev]'
 pytest
 ```
 
-## ライセンス
+## License
 
-Apache-2.0。[LICENSE](LICENSE) を参照してください。
+Apache-2.0. See [LICENSE](LICENSE).
 
-Bindery はクリーンルーム実装です。[NOTICE](NOTICE) に、設計上参考にした
-プロジェクト（Memorix、codebase-memory-mcp、mem0、Basic Memory、
-ByteRover/Cipher）と、**それらのコードを一切含まないこと**を明記しています。
-特に Basic Memory（AGPL-3.0）と ByteRover/Cipher（Elastic License 2.0）からは
-コードを取っていないため、本プロジェクトは前者の派生著作物ではなく、
-後者の利用制限も受けません。
+Bindery is a clean-room implementation. [NOTICE](NOTICE) records the
+projects whose designs informed it - Memorix, codebase-memory-mcp, mem0,
+Basic Memory, and ByteRover/Cipher - and states explicitly that no code from any
+of them is included. In particular, no code was taken from Basic Memory
+(AGPL-3.0) or ByteRover/Cipher (Elastic License 2.0), so this project is neither
+a derivative work of the former nor subject to the latter's restrictions.

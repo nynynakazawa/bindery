@@ -92,18 +92,29 @@ Bindery はこの3つに、ひとつの考え方で答えます。
 
 ## インストール
 
-Python 3.11 以上が必要です。
+Python 3.11 以上と [uv](https://docs.astral.sh/uv/)（`brew install uv`）が必要です。
 
 ```bash
-git clone <this-repo> bindery && cd bindery
-pip install -e .
+git clone https://github.com/nynynakazawa/bindery.git && cd bindery
+uv tool install .
 ```
+
+これで `bindery` が独立した環境に入り、PATH から使えるようになります。pipx を
+既に使っているなら `pipx install .` でも同じです。
+
+`pip install -e .` より上記を推奨します。素の `pip install` は Homebrew や
+システムの Python では[PEP 668](https://peps.python.org/pep-0668/) により
+そもそも失敗し、プロジェクトの `.venv` に入れた場合は **その venv を有効化して
+いる間しか `bindery` コマンドが存在しません**。エージェントがサーバーを起動する
+時点では有効化されていないため、これが `command not found: bindery` の原因に
+なります。`pip` を使うのは自分で管理する仮想環境の中だけにし、その場合は
+エージェント側にフルパスを指定してください。
 
 セマンティック検索（任意。ローカル埋め込みモデル約 100MB を追加。API 呼び出しは
 一切なく、クエリごとの課金も発生しません）:
 
 ```bash
-pip install -e '.[semantic]'
+uv tool install '.[semantic]'
 bindery index --embed
 ```
 

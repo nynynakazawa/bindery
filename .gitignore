@@ -11,3 +11,9 @@ build/
 *.db-wal
 *.db-shm
 .bindery/
+
+# A global core.excludesFile on the author's machine ignored README.md, which
+# left the published repository without the file pyproject.toml points
+# `readme` at - making the release un-installable. Repository rules outrank
+# the global file, so keep this here.
+!README.md

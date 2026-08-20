@@ -200,7 +200,30 @@ def test_install_write_does_not_duplicate_codex_block(tmp_path, monkeypatch, con
     main(["install", "codex", "--write", "--vault", str(config.vault)])
     body = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
     assert body.count("[mcp_servers.bindery]") == 1
-    assert "already defines bindery" in capsys.readouterr().out
+
+
+def test_install_write_updates_a_stale_codex_command(tmp_path, monkeypatch, config, capsys):
+    """Refusing to update our own block strands the old path when the binary moves."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    conf = tmp_path / ".codex" / "config.toml"
+    conf.parent.mkdir(parents=True)
+    conf.write_text(
+        '[mcp_servers.other]\ncommand = "keep-me"\n\n'
+        '[mcp_servers.bindery]\ncommand = "/gone/old/path"\nargs = ["serve"]\n\n'
+        '[mcp_servers.bindery.env]\nBINDERY_VAULT = "/old/vault"\n',
+        encoding="utf-8",
+    )
+    from bindery.cli import main
+
+    main(["install", "codex", "--write", "--vault", str(config.vault)])
+    body = conf.read_text(encoding="utf-8")
+
+    assert "/gone/old/path" not in body
+    assert "/old/vault" not in body
+    assert body.count("[mcp_servers.bindery]") == 1
+    assert "keep-me" in body                       # other servers survive
+    assert str(config.vault) in body
+    assert "updated" in capsys.readouterr().out
 
 
 def test_install_write_preserves_other_codex_servers(tmp_path, monkeypatch, config, capsys):

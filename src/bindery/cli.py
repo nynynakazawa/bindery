@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -346,19 +347,60 @@ def _write_claude(spec: dict) -> str:
     return f"wrote {path} ({spec['scope']} scope)"
 
 
+#: A TOML table header, either ``[table]`` or ``[[array.of.tables]]``.
+_TOML_HEADER = re.compile(r"^\s*\[\[?([^\[\]]*)\]\]?\s*$")
+
+
+def _owns_codex_table(header: str) -> bool:
+    """Is this table one that `install` wrote, and may therefore rewrite?
+
+    Only ``mcp_servers.bindery`` and its subtables. Quotes are stripped because
+    TOML lets a key be written bare or quoted and both name the same table.
+    """
+    name = "".join(header.split()).replace('"', "").replace("'", "")
+    return name == "mcp_servers.bindery" or name.startswith("mcp_servers.bindery.")
+
+
+def _drop_codex_block(current: str) -> tuple[str, bool]:
+    """Remove our own tables from a Codex config, leaving every other one.
+
+    Splitting on table headers rather than parsing and re-emitting TOML is
+    deliberate: this file belongs to the user, and a round trip through a
+    parser would silently reformat their comments and quoting.
+    """
+    kept: list[str] = []
+    dropping = False
+    found = False
+    for line in current.splitlines(keepends=True):
+        header = _TOML_HEADER.match(line)
+        if header:
+            dropping = _owns_codex_table(header.group(1))
+            found = found or dropping
+        if not dropping:
+            kept.append(line)
+    return "".join(kept), found
+
+
 def _write_codex(spec: dict) -> str:
-    """Append the server block, refusing to duplicate an existing one."""
+    """Write the server block, replacing an earlier one rather than duplicating it.
+
+    Leaving an existing block untouched was the safer-looking choice and the
+    wrong one: `bindery` moves when it is reinstalled elsewhere, and a stale
+    ``command`` path means Codex silently loses the memory while the config
+    still looks configured. The block is ours, keyed by our own name, so we
+    replace it; anything else in the file is copied through untouched.
+    """
     path: Path = spec["path"]
     path.parent.mkdir(parents=True, exist_ok=True)
     current = path.read_text(encoding="utf-8") if path.exists() else ""
-    if "[mcp_servers.bindery]" in current:
-        return f"! {path} already defines bindery - left untouched."
     if current:
         backup = path.with_suffix(path.suffix + ".bak")
         backup.write_text(current, encoding="utf-8")
-    separator = "" if not current or current.endswith("\n\n") else ("\n" if current.endswith("\n") else "\n\n")
-    path.write_text(current + separator + _render_codex(spec) + "\n", encoding="utf-8")
-    return f"wrote {path}"
+    remainder, replaced = _drop_codex_block(current)
+    remainder = remainder.rstrip("\n")
+    separator = "\n\n" if remainder else ""
+    path.write_text(remainder + separator + _render_codex(spec) + "\n", encoding="utf-8")
+    return f"updated {path}" if replaced else f"wrote {path}"
 
 
 #: Where each agent reads standing instructions from.
