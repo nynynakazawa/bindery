@@ -17,12 +17,11 @@ from bindery.server import MemoryServer
 
 
 def _call(server, name, args):
-    response = server.handle({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": name, "arguments": args},
-    })
-    result = response["result"]
-    return result["content"][0]["text"], result.get("isError", False)
+    """Invoke a tool the way the MCP layer does, without the transport."""
+    try:
+        return server.call_tool(name, args), False
+    except Exception as exc:  # mirrors what the SDK reports back to the model
+        return f"{type(exc).__name__}: {exc}", True
 
 
 @pytest.fixture

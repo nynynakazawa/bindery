@@ -19,10 +19,13 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries",
 ]
-# No runtime dependencies. The server must start reliably inside two different
-# agent runtimes; every dependency is one more way that can fail in one but not
-# the other.
-dependencies = []
+# The official MCP SDK, and nothing else. The protocol layer used to be
+# hand-written to keep this list empty, which bought one fewer dependency at
+# the price of owning the fastest-moving and least project-specific part of
+# the system - negotiation, error semantics, and every future revision of the
+# wire format. The SDK is a subprocess dependency of an agent that already
+# ships far heavier ones, so the trade no longer paid.
+dependencies = ["mcp>=2,<3"]
 
 [project.optional-dependencies]
 # Semantic search. Optional because these wheels are large and the keyword

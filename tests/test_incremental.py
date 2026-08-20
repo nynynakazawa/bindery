@@ -17,11 +17,8 @@ from bindery.store import Store
 
 
 def _call(server, name, args):
-    response = server.handle({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": name, "arguments": args},
-    })
-    return response["result"]["content"][0]["text"]
+    """Invoke a tool the way the MCP layer does, without the transport."""
+    return server.call_tool(name, args)
 
 
 class FakeBackend:

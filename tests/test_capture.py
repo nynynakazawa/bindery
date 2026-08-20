@@ -1,21 +1,17 @@
 """Automatic session capture (C) and client-neutral setup."""
 
-import io
 import json
 import time
 
 from bindery.config import Config
 from bindery.growth import AUTO_CAPTURE_MIN_SIGNALS, SESSION_PREFIX, SessionRecord, promotion_candidates
-from bindery.server import MemoryServer, serve
+from bindery.server import MemoryServer
 from bindery.store import Store
 
 
 def _call(server, name, args=None):
-    response = server.handle({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": name, "arguments": args or {}},
-    })["result"]
-    return response["content"][0]["text"]
+    """Invoke a tool the way the MCP layer does, without the transport."""
+    return server.call_tool(name, args or {})
 
 
 def _sessions_dir(config):
@@ -121,42 +117,6 @@ def test_session_records_do_not_become_promotion_candidates(config):
 
     reindex(config, store)
     assert "session" not in {c.tag for c in promotion_candidates(store)}
-
-
-def test_client_name_is_recorded_when_offered(config):
-    server = MemoryServer(config)
-    server.handle({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"clientInfo": {"name": "codex", "version": "1"}},
-    })
-    _call(server, "memory_search", {"query": "gap one"})
-    _call(server, "memory_search", {"query": "gap two"})
-    rel = server.finalize_session()
-    assert "codex" in (config.vault / rel).read_text(encoding="utf-8")
-
-
-def test_handshake_without_client_info_still_works(config):
-    server = MemoryServer(config)
-    result = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"})["result"]
-    assert result["serverInfo"]["name"] == "bindery"
-    assert server.client_name == ""
-
-
-def test_serve_finalizes_on_disconnect(config):
-    """EOF is the only moment the server reliably knows a session ended."""
-    messages = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-         "params": {"name": "memory_search", "arguments": {"query": "missing alpha"}}},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-         "params": {"name": "memory_search", "arguments": {"query": "missing beta"}}},
-    ]
-    stdin = io.StringIO("\n".join(json.dumps(m) for m in messages) + "\n")
-    serve(config, stdin=stdin, stdout=io.StringIO())
-
-    files = list(_sessions_dir(config).glob("*.md"))
-    assert len(files) == 1
-    assert "missing alpha" in files[0].read_text(encoding="utf-8")
 
 
 # ------------------------------------------------------ client neutrality --

@@ -1,23 +1,35 @@
-"""MCP server over stdio.
+"""The memory tools, and the MCP surface they are exposed through.
 
-The Model Context Protocol stdio transport is newline-delimited JSON-RPC 2.0.
-Implementing it directly keeps this package dependency-free, which is the point:
-the server has to start reliably inside both Claude Code and Codex, and every
-dependency is one more thing that can be missing in one of those environments
-but not the other.
+The protocol layer is the official SDK's. It was hand-written here to keep the
+package dependency-free, and that trade stopped paying: the wire format is the
+fastest-moving part of MCP and the least related to what this project is
+about. Owning it meant tracking protocol revisions, negotiation, and error
+semantics forever, in exchange for one fewer dependency in a package that only
+ever runs as a subprocess of an agent that already has far heavier ones.
 
-The tool surface is deliberately six tools. Tool schemas are sent to the model
-on every session, so each tool has a standing token cost whether or not it is
-ever called - a large surface is itself a form of the waste this project exists
-to remove.
+What is worth owning is below the transport: the tools themselves. Those live
+on ``MemoryServer``, which knows nothing about MCP and can be called directly.
+
+The tool surface is deliberately eight tools. Tool schemas are sent to the
+model on every session, so each tool has a standing token cost whether or not
+it is ever called - a large surface is itself a form of the waste this project
+exists to remove.
 """
 
 from __future__ import annotations
 
 import json
-import sys
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
+
+# Imported at module scope, not inside build_server: `from __future__ import
+# annotations` makes every annotation a string, and the SDK resolves tool
+# signatures with eval - which cannot see names bound in a function body.
+from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+from pydantic import Field
 
 from . import __version__
 from .config import Config
@@ -36,144 +48,6 @@ from .search import count_outside_scope, search
 from .store import Store
 from .tokens import estimate_tokens
 
-PROTOCOL_VERSION = "2025-06-18"
-
-TOOLS: list[dict[str, Any]] = [
-    {
-        "name": "memory_search",
-        "description": (
-            "Search the shared memory and return only the passages that match, "
-            "under a hard token budget. Use this instead of reading whole notes. "
-            "Works in Japanese and English."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "What to look for."},
-                "scope": {
-                    "type": "string",
-                    "enum": ["project", "global", "all"],
-                    "description": (
-                        "Which memory to search. 'project' (default) is this codebase plus "
-                        "notes that apply everywhere; 'global' is only the cross-project "
-                        "notes; 'all' ignores project boundaries. A decision from another "
-                        "repository is not evidence about this one, so widen deliberately."
-                    ),
-                },
-                "limit": {"type": "integer", "description": "Maximum passages to return."},
-                "max_tokens": {
-                    "type": "integer",
-                    "description": "Hard cap on the size of the response.",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "memory_read",
-        "description": "Read one note in full by its vault-relative path. Use after memory_search when a passage is not enough.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Vault-relative path, e.g. 'project/decision.md'."},
-                "max_tokens": {"type": "integer", "description": "Truncate the note at this size."},
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "memory_write",
-        "description": (
-            "Create or overwrite a note and index it immediately, so the other agent "
-            "can find it straight away. Content is plain Markdown."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Vault-relative path ending in .md"},
-                "content": {"type": "string", "description": "Markdown body."},
-                "title": {"type": "string", "description": "Optional front matter title."},
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional front matter tags.",
-                },
-                "pin": {
-                    "type": "boolean",
-                    "description": "Mark as durable so it always ranks high and never goes stale.",
-                },
-                "project": {
-                    "type": "string",
-                    "description": (
-                        "Which codebase this note is about. Defaults to the current one. "
-                        "Pass an empty string for knowledge that is true everywhere."
-                    ),
-                },
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "memory_learn",
-        "description": (
-            "Record something learned during this session - a decision, a constraint, a "
-            "dead end, a fix that worked. Appends to today's journal and indexes it "
-            "immediately. Call this whenever you learn something the next session would "
-            "otherwise have to rediscover. Tags are what let recurring topics graduate "
-            "into durable notes."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "What was learned, in Markdown."},
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Topic tags, e.g. ['auth', 'deployment'].",
-                },
-                "project": {
-                    "type": "string",
-                    "description": (
-                        "Which codebase this applies to. Defaults to the current one. "
-                        "Pass an empty string for a lesson that is not project-specific."
-                    ),
-                },
-            },
-            "required": ["content"],
-        },
-    },
-    {
-        "name": "memory_review",
-        "description": (
-            "Report how the memory is growing: what agents searched for and could not "
-            "find, which notes carry the load, near-duplicate notes, stale notes, and "
-            "recurring journal topics that should become durable notes."
-        ),
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "memory_links",
-        "description": "List the notes a note links to and the notes that link back, following [[wiki links]].",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "memory_status",
-        "description": "Report vault location, index size, the current project, the index boundary, and whether semantic search is active.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "memory_reindex",
-        "description": "Rescan the vault. Only needed after editing notes outside of an agent.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"force": {"type": "boolean", "description": "Rebuild every note."}},
-        },
-    },
-]
 
 
 class MemoryServer:
@@ -193,6 +67,7 @@ class MemoryServer:
         #: the handshake. Used only to label session records.
         self.client_name = ""
         self._finalized = False
+        self._lock = threading.RLock()
 
     def _index_written(self, rel: str) -> None:
         """Bring the index up to date for the one note that just changed.
@@ -562,6 +437,10 @@ class MemoryServer:
         nothing at all, which is what stops routine lookups from filling the
         vault with noise.
         """
+        with self._lock:
+            return self._finalize_locked()
+
+    def _finalize_locked(self) -> str | None:
         import datetime
         import time
 
@@ -604,78 +483,189 @@ class MemoryServer:
         return rel
 
     def call_tool(self, name: str, args: dict[str, Any]) -> str:
+        """The one entry point to the tools, and the one place they serialise.
+
+        The SDK runs synchronous tools on a worker thread, so two calls can
+        overlap in a way the old single-threaded stdio loop never allowed.
+        SQLite connections, the index, and the session record are all shared
+        mutable state, so calls take their turn rather than each component
+        growing its own locking.
+        """
         handler = getattr(self, f"tool_{name}", None)
         if handler is None:
             raise KeyError(name)
-        return handler(args)
-
-    # ------------------------------------------------------------ dispatch
-
-    def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
-        method = message.get("method")
-        msg_id = message.get("id")
-
-        if method == "initialize":
-            info = (message.get("params") or {}).get("clientInfo") or {}
-            self.client_name = str(info.get("name", "")).strip()
-            return _result(msg_id, {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "bindery", "version": __version__},
-            })
-        if method in {"notifications/initialized", "notifications/cancelled"}:
-            return None
-        if method == "ping":
-            return _result(msg_id, {})
-        if method == "tools/list":
-            return _result(msg_id, {"tools": TOOLS})
-        if method == "tools/call":
-            params = message.get("params") or {}
-            name = params.get("name", "")
-            args = params.get("arguments") or {}
-            try:
-                text = self.call_tool(name, args)
-            except KeyError:
-                return _error(msg_id, -32601, f"Unknown tool: {name}")
-            except Exception as exc:  # surfaced to the model, not swallowed
-                return _result(msg_id, {
-                    "content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}],
-                    "isError": True,
-                })
-            return _result(msg_id, {"content": [{"type": "text", "text": text}]})
-
-        if msg_id is None:
-            return None
-        return _error(msg_id, -32601, f"Unknown method: {method}")
+        with self._lock:
+            return handler(args)
 
 
-def _result(msg_id: Any, result: dict[str, Any]) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+# --------------------------------------------------------------- MCP surface
+
+#: Written out rather than taken from docstrings: these strings are sent to the
+#: model on every session, so they are part of the token budget this project
+#: exists to defend, and they get edited as copy rather than as documentation.
+_SEARCH_DOC = (
+    "Search the shared memory and return only the passages that match, "
+    "under a hard token budget. Use this instead of reading whole notes. "
+    "Works in Japanese and English."
+)
+_READ_DOC = (
+    "Read one note in full by its vault-relative path. Use after memory_search "
+    "when a passage is not enough."
+)
+_WRITE_DOC = (
+    "Create or overwrite a note and index it immediately, so the other agent "
+    "can find it straight away. Content is plain Markdown."
+)
+_LEARN_DOC = (
+    "Record something learned during this session - a decision, a constraint, a "
+    "dead end, a fix that worked. Appends to today's journal and indexes it "
+    "immediately. Call this whenever you learn something the next session would "
+    "otherwise have to rediscover. Tags are what let recurring topics graduate "
+    "into durable notes."
+)
+_REVIEW_DOC = (
+    "Report how the memory is growing: what agents searched for and could not "
+    "find, which notes carry the load, near-duplicate notes, stale notes, and "
+    "recurring journal topics that should become durable notes."
+)
+_LINKS_DOC = (
+    "List the notes a note links to and the notes that link back, following "
+    "[[wiki links]]."
+)
+_STATUS_DOC = (
+    "Report vault location, index size, the current project, the index "
+    "boundary, and whether semantic search is active."
+)
+_REINDEX_DOC = "Rescan the vault. Only needed after editing notes outside of an agent."
+
+_SCOPE_DOC = (
+    "Which memory to search. 'project' (default) is this codebase plus notes "
+    "that apply everywhere; 'global' is only the cross-project notes; 'all' "
+    "ignores project boundaries. A decision from another repository is not "
+    "evidence about this one, so widen deliberately."
+)
+_PROJECT_DOC = (
+    "Which codebase this belongs to. Defaults to the current one. Pass an "
+    "empty string for knowledge that is true everywhere."
+)
 
 
-def _error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+def build_server(config: Config):
+    """Wire the memory tools onto an MCP server.
 
+    The server owns one ``MemoryServer`` for the life of the process, which is
+    what keeps the index open rather than reopening it per call.
+    """
+    memory = MemoryServer(config)
 
-def serve(config: Config, stdin=None, stdout=None) -> None:
-    """Run the stdio loop until EOF."""
-    stdin = stdin or sys.stdin
-    stdout = stdout or sys.stdout
-    server = MemoryServer(config)
-    for line in stdin:
-        line = line.strip()
-        if not line:
-            continue
+    @asynccontextmanager
+    async def lifespan(_server):
         try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        response = server.handle(message)
-        if response is None:
-            continue
-        stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-        stdout.flush()
+            yield {}
+        finally:
+            # EOF on stdin is the only moment the server reliably knows the
+            # session is over, and it is where automatic capture happens.
+            memory.finalize_session()
 
-    # EOF: the client went away. This is the only moment the server reliably
-    # knows a session is over, so it is where automatic capture happens.
-    server.finalize_session()
+    mcp = MCPServer("bindery", version=__version__, lifespan=lifespan)
+
+    def _note_client(ctx: Context) -> None:
+        """Label session records with whichever agent is on the other end.
+
+        Both spellings are accepted because the SDK has carried this field
+        under each at different times, and a session record losing its label is
+        not worth an exception - the record itself still gets written.
+        """
+        try:
+            params = ctx.session.client_params
+            info = getattr(params, "client_info", None) or getattr(params, "clientInfo", None)
+            name = str(getattr(info, "name", "") or "")
+            if name:
+                memory.client_name = name
+        except Exception:
+            pass
+
+    # structured_output=False on every tool. These return prose for the model
+    # to read, and a `str` return type otherwise makes the SDK also emit a
+    # structuredContent block containing the identical string - doubling the
+    # size of every response in a project whose entire purpose is to keep
+    # responses small.
+    @mcp.tool(name="memory_search", description=_SEARCH_DOC, structured_output=False)
+    def memory_search(
+        ctx: Context,
+        query: Annotated[str, Field(description="What to look for.")],
+        scope: Annotated[Literal["project", "global", "all"], Field(description=_SCOPE_DOC)] = "project",
+        limit: Annotated[int | None, Field(description="Maximum passages to return.")] = None,
+        max_tokens: Annotated[int | None, Field(description="Hard cap on the size of the response.")] = None,
+    ) -> str:
+        _note_client(ctx)
+        return memory.call_tool("memory_search",
+            {"query": query, "scope": scope, "limit": limit, "max_tokens": max_tokens}
+        )
+
+    @mcp.tool(name="memory_read", description=_READ_DOC, structured_output=False)
+    def memory_read(
+        path: Annotated[str, Field(description="Vault-relative path, e.g. 'project/decision.md'.")],
+        max_tokens: Annotated[int | None, Field(description="Truncate the note at this size.")] = None,
+    ) -> str:
+        return memory.call_tool("memory_read", {"path": path, "max_tokens": max_tokens})
+
+    @mcp.tool(name="memory_write", description=_WRITE_DOC, structured_output=False)
+    def memory_write(
+        path: Annotated[str, Field(description="Vault-relative path ending in .md")],
+        content: Annotated[str, Field(description="Markdown body.")],
+        title: Annotated[str, Field(description="Optional front matter title.")] = "",
+        tags: Annotated[list[str] | None, Field(description="Optional front matter tags.")] = None,
+        pin: Annotated[
+            bool,
+            Field(description="Mark as durable so it always ranks high and never goes stale."),
+        ] = False,
+        project: Annotated[str | None, Field(description=_PROJECT_DOC)] = None,
+    ) -> str:
+        return memory.call_tool("memory_write",
+            {
+                "path": path, "content": content, "title": title,
+                "tags": tags or [], "pin": pin, "project": project,
+            }
+        )
+
+    @mcp.tool(name="memory_learn", description=_LEARN_DOC, structured_output=False)
+    def memory_learn(
+        ctx: Context,
+        content: Annotated[str, Field(description="What was learned, in Markdown.")],
+        tags: Annotated[
+            list[str] | None,
+            Field(description="Topic tags, e.g. ['auth', 'deployment']."),
+        ] = None,
+        project: Annotated[str | None, Field(description=_PROJECT_DOC)] = None,
+    ) -> str:
+        _note_client(ctx)
+        return memory.call_tool("memory_learn",
+            {"content": content, "tags": tags or [], "project": project}
+        )
+
+    @mcp.tool(name="memory_review", description=_REVIEW_DOC, structured_output=False)
+    def memory_review() -> str:
+        return memory.call_tool("memory_review", {})
+
+    @mcp.tool(name="memory_links", description=_LINKS_DOC, structured_output=False)
+    def memory_links(path: Annotated[str, Field(description="Vault-relative path.")]) -> str:
+        return memory.call_tool("memory_links", {"path": path})
+
+    @mcp.tool(name="memory_status", description=_STATUS_DOC, structured_output=False)
+    def memory_status() -> str:
+        return memory.call_tool("memory_status", {})
+
+    @mcp.tool(name="memory_reindex", description=_REINDEX_DOC, structured_output=False)
+    def memory_reindex(
+        force: Annotated[bool, Field(description="Rebuild every note.")] = False,
+    ) -> str:
+        return memory.call_tool("memory_reindex", {"force": force})
+
+    return mcp, memory
+
+
+def serve(config: Config) -> None:
+    """Run the MCP server on stdio until the client disconnects."""
+    mcp, _memory = build_server(config)
+    mcp.run("stdio")

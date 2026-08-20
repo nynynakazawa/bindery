@@ -69,8 +69,11 @@ passages under a hard token budget, from an index both agents share.
   `memory_review`.
 - **Optional semantic search.** Install one extra and hybrid keyword + vector
   retrieval turns on. It is optional because keyword search alone already works.
-- **Zero required dependencies.** Python standard library only. This matters:
-  the server has to start reliably inside two different agent runtimes.
+- **One dependency: the official MCP SDK.** Everything else is the Python
+  standard library. The protocol layer was hand-written for a while to keep
+  even that off the list, but the wire format is the fastest-moving part of MCP
+  and the least specific to this project - version negotiation alone is worth
+  more than the dependency costs.
 
 ## What it deliberately does not do
 

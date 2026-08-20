@@ -19,11 +19,11 @@ DAY = 86400.0
 
 
 def _call(server, name, args=None):
-    response = server.handle({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": name, "arguments": args or {}},
-    })["result"]
-    return response["content"][0]["text"], response.get("isError", False)
+    """Invoke a tool the way the MCP layer does, without the transport."""
+    try:
+        return server.call_tool(name, args or {}), False
+    except Exception as exc:  # mirrors what the SDK reports back to the model
+        return f"{type(exc).__name__}: {exc}", True
 
 
 # ------------------------------------------------------------- weighting --

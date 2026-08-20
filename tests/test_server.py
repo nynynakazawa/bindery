@@ -1,3 +1,10 @@
+"""The memory tools, called directly.
+
+Protocol behaviour - the handshake, schemas, error shapes - is the SDK's
+responsibility now and is covered in test_protocol.py against a real client.
+What is left here is what this project actually implements.
+"""
+
 import json
 
 from bindery.config import Config
@@ -5,45 +12,17 @@ from bindery.server import MemoryServer
 
 
 def _call(server, name, args=None):
-    response = server.handle({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": name, "arguments": args or {}},
-    })
-    result = response["result"]
-    return result["content"][0]["text"], result.get("isError", False)
+    """Invoke a tool the way the MCP layer does, without the transport."""
+    try:
+        return server.call_tool(name, args or {}), False
+    except Exception as exc:  # mirrors what the SDK reports back to the model
+        return f"{type(exc).__name__}: {exc}", True
 
 
-def test_handshake_reports_protocol_and_identity(config):
+def test_unknown_tool_is_refused(config):
     server = MemoryServer(config)
-    result = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"})["result"]
-    assert result["protocolVersion"]
-    assert result["serverInfo"]["name"] == "bindery"
-    assert "tools" in result["capabilities"]
-
-
-def test_notifications_get_no_reply(config):
-    """Replying to a notification is a protocol violation."""
-    server = MemoryServer(config)
-    assert server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
-
-
-def test_tool_surface_stays_small(config):
-    """Every tool schema costs context tokens on every session, so the surface
-    is capped deliberately. Raising this number is a design decision."""
-    server = MemoryServer(config)
-    tools = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
-    assert len(tools) == 8
-    for tool in tools:
-        assert tool["description"] and tool["inputSchema"]["type"] == "object"
-
-
-def test_unknown_tool_is_a_jsonrpc_error(config):
-    server = MemoryServer(config)
-    response = server.handle({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": "does_not_exist", "arguments": {}},
-    })
-    assert response["error"]["code"] == -32601
+    _text, error = _call(server, "does_not_exist", {})
+    assert error
 
 
 def test_write_then_search_round_trip(config):

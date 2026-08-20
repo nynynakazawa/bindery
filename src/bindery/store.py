@@ -136,7 +136,11 @@ class Store:
         # SQLite returns SQLITE_BUSY immediately and the busy timeout does not
         # apply, because waiting could only deadlock. IMMEDIATE takes the lock
         # up front, so the second writer waits its turn and then proceeds.
-        self.conn = sqlite3.connect(db_path, isolation_level=None)
+        # check_same_thread=False because the MCP SDK dispatches synchronous
+        # tools onto a worker thread, and not always the same one. Nothing here
+        # is thread-safe on its own, so MemoryServer serialises every tool call
+        # behind one lock - that, not this flag, is what makes it safe.
+        self.conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # busy_timeout FIRST. Switching journal modes needs a brief exclusive
         # lock, and with several agents starting at once one of them will find
