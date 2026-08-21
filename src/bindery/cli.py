@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -339,26 +340,77 @@ def _client_targets(config: Config, scope: str = "user") -> dict[str, dict]:
     claude_path = (
         Path.cwd() / ".mcp.json" if scope == "project" else Path.home() / ".claude.json"
     )
-    return {
+    base = {"command": command, "args": args, "env": env}
+    targets: dict[str, dict] = {
         "claude": {
-            "label": "Claude Code",
+            "label": "Claude Code (app, CLI, and VS Code extension)",
+            # All three read this same file, so one entry covers them.
             "path": claude_path,
             "scope": scope,
-            "command": command,
-            "args": args,
-            "env": env,
+            "format": "mcpServers",
+            **base,
         },
         "codex": {
-            "label": "Codex",
+            "label": "Codex (CLI, IDE extension, app)",
             # Codex reads MCP servers from one global file; there is no
             # per-project equivalent to fall back to.
             "path": Path.home() / ".codex" / "config.toml",
             "scope": "user",
-            "command": command,
-            "args": args,
-            "env": env,
+            "format": "toml",
+            **base,
+        },
+        "vscode": {
+            # GitHub Copilot's agent mode, and anything else using VS Code's
+            # own MCP support. A different schema from Claude's: servers live
+            # under `servers` and each declares its transport.
+            "label": "VS Code (Copilot agent mode)",
+            "path": _vscode_mcp_path(),
+            "scope": "user",
+            "format": "servers",
+            **base,
+        },
+        "cursor": {
+            "label": "Cursor",
+            "path": Path.home() / ".cursor" / "mcp.json",
+            "scope": "user",
+            "format": "mcpServers",
+            **base,
         },
     }
+    for home in _codex_account_homes():
+        # codex-multi gives each account its own CODEX_HOME, and a server
+        # registered in ~/.codex is invisible from all of them. Skipping these
+        # is how background Codex runs end up with no shared memory at all -
+        # which is the one thing this project exists to provide.
+        targets[f"codex:{home.name}"] = {
+            "label": f"Codex account '{home.name}'",
+            "path": home / "config.toml",
+            "scope": "user",
+            "format": "toml",
+            **base,
+        }
+    return targets
+
+
+def _vscode_mcp_path() -> Path:
+    """Where VS Code keeps user-level MCP servers, per platform."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Code" / "User" / "mcp.json"
+    if sys.platform == "win32":  # pragma: no cover - not exercised on CI
+        return Path(os.environ.get("APPDATA", Path.home())) / "Code" / "User" / "mcp.json"
+    return Path.home() / ".config" / "Code" / "User" / "mcp.json"
+
+
+def _codex_account_homes() -> list[Path]:
+    """Extra CODEX_HOME directories, as created by codex-multi.
+
+    Each is a separate Codex account with its own config, so each needs its
+    own registration. Sorted so that output is stable.
+    """
+    root = Path.home() / ".codex-homes"
+    if not root.is_dir():
+        return []
+    return sorted(child for child in root.iterdir() if child.is_dir())
 
 
 def _detect_clients() -> set[str]:
@@ -368,20 +420,34 @@ def _detect_clients() -> set[str]:
         found.add("claude")
     if shutil.which("codex") or (Path.home() / ".codex").exists():
         found.add("codex")
+    if _vscode_mcp_path().parent.is_dir():
+        found.add("vscode")
+    if (Path.home() / ".cursor").is_dir():
+        found.add("cursor")
+    for home in _codex_account_homes():
+        found.add(f"codex:{home.name}")
     return found
 
 
-def _render_claude(spec: dict) -> str:
-    payload = {
-        "mcpServers": {
-            "bindery": {
-                "command": spec["command"],
-                "args": spec["args"],
-                "env": spec["env"],
-            }
-        }
+def _entry_for(spec: dict) -> dict:
+    """The server entry itself, in whichever shape this client expects."""
+    entry = {
+        "command": spec["command"],
+        "args": spec["args"],
+        "env": spec["env"],
     }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    if spec["format"] == "servers":
+        # VS Code requires the transport to be named explicitly.
+        return {"type": "stdio", **entry}
+    return entry
+
+
+def _render_json(spec: dict) -> str:
+    return json.dumps({spec["format"]: {"bindery": _entry_for(spec)}}, ensure_ascii=False, indent=2)
+
+
+def _render_claude(spec: dict) -> str:
+    return _render_json(spec)
 
 
 def _render_codex(spec: dict) -> str:
@@ -397,13 +463,14 @@ def _render_codex(spec: dict) -> str:
     return "\n".join(lines)
 
 
-def _write_claude(spec: dict) -> str:
-    """Merge into Claude Code's JSON config, preserving everything else.
+def _write_json(spec: dict) -> str:
+    """Merge into a JSON config, preserving everything else.
 
     ``~/.claude.json`` is not a config file the user wrote - it is live
     application state, tens of kilobytes of it. So this reads, adds one key
-    under ``mcpServers``, and writes the whole document back unchanged
-    otherwise, after taking a backup.
+    under the client's server map, and writes the whole document back
+    unchanged otherwise, after taking a backup. The same care applies to
+    VS Code's and Cursor's files, which hold other people's servers.
     """
     path: Path = spec["path"]
     existing: dict = {}
@@ -416,14 +483,28 @@ def _write_claude(spec: dict) -> str:
         if not isinstance(existing, dict):
             return f"! {path} is not a JSON object - left untouched."
         path.with_suffix(path.suffix + ".bak").write_text(raw, encoding="utf-8")
-    servers = existing.setdefault("mcpServers", {})
-    servers["bindery"] = {
-        "command": spec["command"],
-        "args": spec["args"],
-        "env": spec["env"],
-    }
+    servers = existing.setdefault(spec["format"], {})
+    if not isinstance(servers, dict):
+        return f"! {path} has a non-object {spec['format']!r} - left untouched."
+    replaced = "bindery" in servers
+    servers["bindery"] = _entry_for(spec)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return f"wrote {path} ({spec['scope']} scope)"
+    verb = "updated" if replaced else "wrote"
+    return f"{verb} {path} ({spec['scope']} scope)"
+
+
+def _write_claude(spec: dict) -> str:
+    return _write_json(spec)
+
+
+def _write_target(spec: dict) -> str:
+    """Apply one client's configuration, in whatever format it uses."""
+    return _write_codex(spec) if spec["format"] == "toml" else _write_json(spec)
+
+
+def _render_target(spec: dict) -> str:
+    return _render_codex(spec) if spec["format"] == "toml" else _render_json(spec)
 
 
 #: A TOML table header, either ``[table]`` or ``[[array.of.tables]]``.
@@ -539,6 +620,9 @@ def cmd_install(args: argparse.Namespace) -> int:
     config = _config_from(args)
     scope = "project" if getattr(args, "local", False) else "user"
     targets = _client_targets(config, scope)
+    if args.client and args.client not in targets:
+        print(f"Unknown client {args.client!r}. Known: {', '.join(sorted(targets))}", file=sys.stderr)
+        return 2
     chosen = [args.client] if args.client else sorted(targets)
     detected = _detect_clients()
 
@@ -549,10 +633,10 @@ def cmd_install(args: argparse.Namespace) -> int:
         seen = " (detected)" if client in detected else " (not detected on this machine)"
         print(f"# {spec['label']}{seen} - {spec['scope']} scope - {spec['path']}")
         print()
-        print(_render_claude(spec) if client == "claude" else _render_codex(spec))
+        print(_render_target(spec))
         if args.write:
             print()
-            print(_write_claude(spec) if client == "claude" else _write_codex(spec))
+            print(_write_target(spec))
 
     print()
     print("# Point every client at the SAME BINDERY_VAULT - that is what shares the memory.")
@@ -595,7 +679,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         spec = targets[client]
         mark = "detected" if client in detected else "not detected"
         if args.write:
-            result = _write_claude(spec) if client == "claude" else _write_codex(spec)
+            result = _write_target(spec)
             print(f"  {spec['label']} ({mark}): {result}")
         else:
             print(f"  {spec['label']} ({mark}): would write {spec['path']} [{spec['scope']} scope]")
@@ -664,7 +748,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_install = sub.add_parser("install", help="Print (or apply) configuration for every agent.")
     _add_common(p_install)
     _add_project(p_install)
-    p_install.add_argument("client", nargs="?", choices=["claude", "codex"],
+    # Not a fixed `choices` list: the Codex account entries are discovered at
+    # runtime, so the valid names depend on the machine.
+    p_install.add_argument("client", nargs="?",
                            help="Limit output to one client. Default: all of them.")
     p_install.add_argument("--write", action="store_true",
                            help="Apply the configuration instead of printing it. Backs up first.")
