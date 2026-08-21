@@ -71,16 +71,30 @@ passages under a hard token budget, from an index both agents share.
 - **Automatic session records.** When a client disconnects, the server writes
   down what it observed by itself - the questions that came back empty, the
   notes that were touched. No model call, no agent cooperation required.
+- **Measured, not asserted.** `bench/` scores retrieval on a corpus shaped like
+  a coding agent's memory. Every default in this list is there because the
+  numbers say it earns its place; see [bench/README.md](bench/README.md).
 - **Consolidation, so growth does not become sprawl.** Near-duplicate passages and
   never-retrieved notes are detected automatically and reported by
   `memory_review`.
-- **Optional semantic search.** Install one extra and hybrid keyword + vector
-  retrieval turns on. It is optional because keyword search alone already works.
-- **One dependency: the official MCP SDK.** Everything else is the Python
-  standard library. The protocol layer was hand-written for a while to keep
-  even that off the list, but the wire format is the fastest-moving part of MCP
-  and the least specific to this project - version negotiation alone is worth
-  more than the dependency costs.
+- **Hybrid retrieval, fixed.** Exact match, BM25 over the full-text index, and
+  dense vectors, fused with Reciprocal Rank Fusion. Not a setting: keyword
+  search scores zero on every paraphrase in the benchmark, semantic search
+  loses exact identifiers and two-character Japanese outright, and fusing them
+  beats both on every aggregate. The embedding model is local, multilingual,
+  and downloaded once by `setup`.
+- **Nothing forgotten because nobody wrote it down.** Finished sessions from
+  every agent are imported as searchable episodes - reduced, never summarised,
+  so no model call and no invented detail. What survives is what happened;
+  hidden reasoning, telemetry, and successful command output do not.
+- **Three layers, one search.** Durable notes state what is true, journal
+  entries state what somebody concluded that day, episodes record what
+  happened. You never pick between them: it is a prior on the ranking, so a
+  written note outranks a transcript of working it out, and the transcript is
+  still there when nothing better is.
+- **Secrets are stripped from anything captured automatically.** Key material,
+  provider tokens, anything named like a password, and `<private>` blocks -
+  unconditionally, with no setting to turn it off.
 
 ## What it deliberately does not do
 
@@ -122,13 +136,12 @@ activated - which it is not when an agent launches the server. Use `pip` only
 inside a virtualenv you manage yourself, and expect to point your agents at the
 full path.
 
-Optional semantic search (adds a local multilingual embedding model, about
-220 MB, downloaded once - no API calls and no per-query cost):
+Reinstalling from a checkout needs `--reinstall`, not `--force`: with an
+unchanged version number, `--force` reuses the cached build and you get the
+old code.
 
-```bash
-uv tool install '.[semantic]'
-bindery index --embed
-```
+`setup` downloads the embedding model on first run - about 220 MB, once, local,
+no API calls and no per-query cost.
 
 ## Set up
 
@@ -141,10 +154,25 @@ export BINDERY_VAULT="$HOME/Obsidian/MyVault"   # an existing Obsidian vault wor
 
 bindery setup            # preview: lists every file it would touch
 bindery setup --write    # do it
-bindery status           # confirm
 ```
 
-That is the whole installation.
+That is the whole installation. `setup --write` fetches the embedding model,
+indexes the vault, records which sessions already exist so that none of your
+history is ingested, configures every agent it finds, installs the agent
+instructions, and then proves it works by writing a note and searching for it:
+
+```
+checking:
+  write and retrieve   ok
+  semantic search      fastembed
+  vector index         sqlite-vec
+  agents configured    claude, codex, cursor, vscode
+  indexed              1,284 note(s), 4,102 passage(s)
+
+Bindery is ready. Memory will now maintain itself.
+```
+
+Re-running it changes nothing that is already correct.
 
 ### Choosing what gets indexed
 
@@ -285,6 +313,45 @@ determines whether anything is ever written down.
 
 ---
 
+## What gets remembered
+
+Three layers, written to different places and searched together.
+
+| | Written by | Where | Weight |
+| --- | --- | --- | ---: |
+| **Durable** | `memory_write`, or you, in Obsidian | anywhere in the vault | 1.00 |
+| **Journal** | `memory_learn` | `journal/<project>/<date>.md` | 0.90 |
+| **Episode** | imported automatically from finished sessions | `journal/episodes/<project>/` | 0.65 |
+
+You never choose between them. A search covers all three, and the weights make
+a note somebody wrote outrank a transcript of them working it out - while
+leaving the transcript there for when nothing better exists.
+
+Episodes are what stops `memory_learn` being the single point of failure. An
+agent that forgets to record something still leaves a transcript, and finished
+transcripts are imported at the next server start - so a Claude session that
+ended overnight is searchable from Codex in the morning, with no daemon and no
+editor hook.
+
+They are **reduced, not summarised**. Nothing calls a model: a summary is a
+second thing that can be wrong, and it discards the detail that turns out to
+matter. What is thrown away is what was never knowledge - hidden reasoning,
+telemetry, protocol noise, dependency paths, and command output that reported
+success. Failures and test results are kept verbatim. In practice a 33 MB
+transcript becomes about 15 KB.
+
+Two rules make this safe to leave on:
+
+- **Your history is not ingested.** `setup` records every session that already
+  exists and imports only what finishes afterwards.
+- **Secrets are stripped unconditionally.** Key material, provider tokens,
+  anything named like a password, long encoded blobs, and `<private>…</private>`
+  blocks. There is no setting to turn it off, because redaction that is
+  occasionally too eager loses a word from an old transcript, and redaction
+  that is too permissive publishes a credential.
+
+Set `BINDERY_EPISODES=0` to turn capture off entirely.
+
 ## Tools
 
 | Tool | Purpose |
@@ -347,6 +414,7 @@ turned into clutter.
 | `BINDERY_INCLUDE` | unset | Comma-separated directories to index, to the exclusion of all others. |
 | `BINDERY_EXCLUDE` | unset | Comma-separated directories never to index. |
 | `BINDERY_PROJECT` | detected | Name of the codebase these searches are about. Empty disables scoping. |
+| `BINDERY_EPISODES` | on | Set to `0` to stop importing finished sessions. |
 
 `bindery install` writes to every client it finds:
 
