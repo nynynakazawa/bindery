@@ -741,6 +741,38 @@ def build_server(config: Config):
 
 
 def serve(config: Config) -> None:
-    """Run the MCP server on stdio until the client disconnects."""
-    mcp, _memory = build_server(config)
+    """Run the MCP server on stdio until the client disconnects.
+
+    Disconnection is usually EOF on stdin, which the lifespan handles. It is
+    not always: quitting an agent sends SIGTERM to its subprocesses, and the
+    default disposition kills the process outright - so the session record,
+    which is written during teardown, was silently lost every time an app was
+    quit rather than a conversation ended. That is the common path, not an
+    edge case.
+    """
+    import os
+    import signal
+
+    mcp, memory = build_server(config)
+
+    def finish(_signum, _frame):
+        # os._exit rather than SystemExit: the exception would be raised into
+        # whatever the event loop was doing and swallowed, leaving the process
+        # alive and the client waiting. Skipping interpreter shutdown is safe
+        # here because the only state that matters is already on disk - the
+        # record is written atomically and SQLite commits synchronously.
+        try:
+            memory.finalize_session()
+        except Exception:
+            pass
+        os._exit(0)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        handler = getattr(signal, name, None)
+        if handler is not None:
+            try:
+                signal.signal(handler, finish)
+            except (ValueError, OSError):  # pragma: no cover - not the main thread
+                pass
+
     mcp.run("stdio")

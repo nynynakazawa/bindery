@@ -212,3 +212,61 @@ def test_a_quiet_session_records_nothing(config):
 
     _run(go())
     assert not list((config.vault / "journal").rglob("*.md"))
+
+
+def test_a_terminated_server_still_writes_its_session_record(config, tmp_path):
+    """Quitting an agent sends SIGTERM, which is the common way a session ends."""
+    import json
+    import os
+    import signal
+    import subprocess
+    import sys
+    import textwrap
+    import time
+
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        from bindery.config import Config
+        from bindery.server import serve
+
+        config = Config.resolve(
+            vault=sys.argv[2], state_dir=sys.argv[3], semantic=False, project="alpha"
+        )
+        serve(config)
+        """
+    )
+    src = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src")
+    env = {**os.environ, "BINDERY_EPISODES": "0", "BINDERY_SEMANTIC": "0"}
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, src, str(config.vault), str(config.state_dir)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env,
+    )
+    try:
+        for message in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": {"name": "t", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "memory_search", "arguments": {"query": "missing alpha"}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "memory_search", "arguments": {"query": "missing beta"}}},
+        ):
+            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.flush()
+        deadline = time.time() + 20
+        seen = 0
+        while seen < 3 and time.time() < deadline:
+            if process.stdout.readline():
+                seen += 1
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=20)
+    finally:
+        if process.poll() is None:  # pragma: no cover
+            process.kill()
+
+    records = list((config.vault / "journal" / "sessions").glob("*.md"))
+    assert records, "SIGTERM lost the session record"
+    assert "missing alpha" in records[0].read_text(encoding="utf-8")
