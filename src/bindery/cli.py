@@ -938,6 +938,15 @@ def _health_check(config: Config, store: Store | None) -> bool:
     if backend and unembedded > 0:
         print(f"  ! {unembedded} passage(s) not embedded - run: bindery index --embed")
 
+    # The agents launch the server by absolute path, so they work regardless -
+    # but a human whose PATH is missing the directory gets "command not found"
+    # from every instruction in the README, with nothing explaining why.
+    on_path = shutil.which("bindery")
+    installed = Path(sys.executable).parent / "bindery"
+    if not on_path and installed.exists():
+        print(f"  ! `bindery` is not on your PATH. Add: export PATH=\"{installed.parent}:$PATH\"")
+        print("    Agents are unaffected - they use the full path.")
+
     clients = sorted(_detect_clients())
     print(f"  agents configured    {', '.join(clients) if clients else 'none detected'}")
     print(f"  indexed              {stats['notes']} note(s), {stats['chunks']} passage(s)")

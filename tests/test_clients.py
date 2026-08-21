@@ -209,3 +209,24 @@ def test_the_health_check_writes_inside_the_index_boundary(config, home, capsys)
     out = capsys.readouterr().out
     assert "write and retrieve   ok" in out
     assert "Bindery is ready" in out
+
+
+def test_setup_says_when_the_command_is_not_on_your_path(config, home, monkeypatch, capsys):
+    """Every instruction in the README is `bindery ...`; silence here is cruel."""
+    import bindery.cli as cli
+
+    installed = home / "toolbin"
+    installed.mkdir()
+    (installed / "python").touch()
+    (installed / "bindery").touch()
+    monkeypatch.setattr(cli.sys, "executable", str(installed / "python"))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+
+    (config.vault / "a.md").write_text("# A\n\n本文。\n", encoding="utf-8")
+    main(["setup", "--write", "--vault", str(config.vault),
+          "--no-semantic", "--state-dir", str(config.state_dir)])
+
+    out = capsys.readouterr().out
+    assert "not on your PATH" in out
+    assert str(installed) in out
+    assert "Agents are unaffected" in out
