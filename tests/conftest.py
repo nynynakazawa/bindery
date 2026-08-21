@@ -10,6 +10,19 @@ from bindery.indexer import reindex  # noqa: E402
 from bindery.store import Store  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def no_real_sessions(monkeypatch):
+    """Keep the suite off this machine's actual transcripts.
+
+    Episode capture reads the real ~/.claude and ~/.codex by design, so
+    without this every test that constructs a server would import the
+    developer's own sessions into a temporary vault - slow, and a surprising
+    thing for a test run to do. Tests that exercise capture set up a fake home
+    and turn it back on.
+    """
+    monkeypatch.setenv("BINDERY_EPISODES", "0")
+
+
 @pytest.fixture
 def vault(tmp_path):
     directory = tmp_path / "vault"

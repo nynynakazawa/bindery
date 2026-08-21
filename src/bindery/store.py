@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS notes (
     mtime    REAL NOT NULL DEFAULT 0,
     digest   TEXT NOT NULL DEFAULT '',
     -- Which codebase this note is about; '' means it spans all of them.
-    project  TEXT NOT NULL DEFAULT ''
+    project  TEXT NOT NULL DEFAULT '',
+    -- durable | journal | episode. See indexer.TIER_PRIOR.
+    tier     TEXT NOT NULL DEFAULT 'durable'
 );
 CREATE INDEX IF NOT EXISTS notes_project ON notes(project);
 
@@ -125,6 +127,7 @@ class Chunk:
     body: str
     tokens: int
     project: str = ""
+    tier: str = "durable"
 
 
 def pack_vector(values: list[float]) -> bytes:
@@ -447,12 +450,14 @@ class Store:
         chunks: list[tuple[str, str, int]],
         links: list[str],
         project: str = "",
+        tier: str = "durable",
     ) -> int:
         """Replace a note and all of its derived rows atomically."""
         with self.write():
             return self._upsert_note_locked(
                 path=path, title=title, tags=tags, mtime=mtime,
-                digest=digest, chunks=chunks, links=links, project=project,
+                digest=digest, chunks=chunks, links=links,
+                project=project, tier=tier,
             )
 
     def _upsert_note_locked(
@@ -466,11 +471,13 @@ class Store:
         chunks: list[tuple[str, str, int]],
         links: list[str],
         project: str = "",
+        tier: str = "durable",
     ) -> int:
         self.delete_note(path)
         cur = self.conn.execute(
-            "INSERT INTO notes(path, title, tags, mtime, digest, project) VALUES(?,?,?,?,?,?)",
-            (path, title, json.dumps(tags, ensure_ascii=False), mtime, digest, project),
+            "INSERT INTO notes(path, title, tags, mtime, digest, project, tier) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (path, title, json.dumps(tags, ensure_ascii=False), mtime, digest, project, tier),
         )
         note_id = int(cur.lastrowid)
         for seq, (breadcrumb, body, tokens) in enumerate(chunks):
@@ -516,7 +523,7 @@ class Store:
         marks = ",".join("?" * len(chunk_ids))
         rows = self.conn.execute(
             f"""SELECT c.id, c.note_id, c.breadcrumb, c.body, c.tokens,
-                       n.path, n.title, n.project
+                       n.path, n.title, n.project, n.tier
                 FROM chunks c JOIN notes n ON n.id = c.note_id
                 WHERE c.id IN ({marks})""",
             chunk_ids,
@@ -531,6 +538,7 @@ class Store:
                 body=r["body"],
                 tokens=r["tokens"],
                 project=r["project"],
+                tier=r["tier"],
             )
             for r in rows
         }

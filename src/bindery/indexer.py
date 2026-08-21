@@ -40,6 +40,40 @@ SKIP_DIRS = {".git", ".obsidian", ".trash", "node_modules", "__pycache__", ".bin
 #: is unaffected by anything written into the vault.
 SKIP_PREFIXES = ("journal/sessions/",)
 
+#: Where imported session transcripts land. Indexed, unlike the records above,
+#: because their whole purpose is to be findable.
+EPISODE_PREFIX = "journal/episodes/"
+
+#: What a passage is, which is not the same as how relevant it is.
+#:
+#: A durable note states what is currently true. A journal entry states what
+#: somebody concluded on a particular day. An episode is a transcript of what
+#: happened, kept verbatim - useful precisely because nobody curated it, and
+#: for the same reason not something to quote as the current design.
+#:
+#: These are priors on the fused score, not filters. A superseded decision
+#: still surfaces when nothing better matches, which is the point of keeping
+#: it; it just does not outrank the note that superseded it.
+TIER_DURABLE = "durable"
+TIER_JOURNAL = "journal"
+TIER_EPISODE = "episode"
+
+TIER_PRIOR = {
+    TIER_DURABLE: 1.00,
+    TIER_JOURNAL: 0.90,
+    TIER_EPISODE: 0.65,
+}
+
+
+def tier_of(rel: str) -> str:
+    """Which layer a note belongs to, from where it sits."""
+    rel = rel.replace("\\", "/")
+    if rel.startswith(EPISODE_PREFIX):
+        return TIER_EPISODE
+    if rel.startswith("journal/"):
+        return TIER_JOURNAL
+    return TIER_DURABLE
+
 
 def _under(rel: str, prefix: str) -> bool:
     """Is ``rel`` the file ``prefix`` or something inside the directory ``prefix``?
@@ -351,6 +385,7 @@ def _write_note(config: Config, store: Store, path: Path, rel: str, text: str, d
             None if note.project is None else {"project": note.project},
             include=config.include,
         ),
+        tier=tier_of(rel),
         mtime=path.stat().st_mtime,
         digest=digest,
         chunks=chunks,

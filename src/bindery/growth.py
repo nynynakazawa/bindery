@@ -110,6 +110,35 @@ def usage_score(path: str, usage: dict[str, tuple[int, float, int]], now: float)
     return frequency * recency
 
 
+def apply_tier_prior(
+    scored: list[tuple[int, float, list[str]]],
+    chunk_tiers: dict[int, str],
+) -> list[tuple[int, float, list[str]]]:
+    """Weight a fused ranking by what kind of memory each passage is.
+
+    A verbatim transcript and a decision note can match a query equally well
+    while being worth very different amounts: one records that something was
+    said, the other records what is true. Applied as a prior rather than a
+    filter, so a superseded decision or an old session still surfaces when
+    nothing better matches - which is the entire reason for keeping them.
+    """
+    from .indexer import TIER_PRIOR
+
+    return sorted(
+        (
+            (chunk_id, score * TIER_PRIOR.get(chunk_tiers.get(chunk_id, ""), 1.0), sources)
+            for chunk_id, score, sources in scored
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+
+def shingles(text: str) -> set[int]:
+    """Public name for the near-duplicate signature, used by retrieval too."""
+    return _shingles(text)
+
+
 def apply_usage_boost(
     scored: list[tuple[int, float, list[str]]],
     chunk_paths: dict[int, str],

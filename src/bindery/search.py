@@ -26,9 +26,28 @@ from dataclasses import dataclass
 
 from .config import Config
 from .embed import cosine, load_backend
-from .growth import apply_usage_boost
+from .growth import apply_tier_prior, apply_usage_boost, shingles
 from .store import Chunk, Store, unpack_vector
 from .tokens import estimate_tokens
+
+#: How similar two passages have to be before the second one is dropped from
+#: the results. Lower than the threshold used for reporting duplicate *notes*,
+#: because here the cost of keeping a redundant passage is immediate - it is
+#: budget spent restating something the caller has already been told.
+RESULT_DUPLICATE_THRESHOLD = 0.7
+
+
+def _is_redundant(signature: set[int], kept: list[set[int]]) -> bool:
+    if not signature:
+        return False
+    for other in kept:
+        if not other:
+            continue
+        overlap = len(signature & other)
+        if overlap / min(len(signature), len(other)) >= RESULT_DUPLICATE_THRESHOLD:
+            return True
+    return False
+
 
 #: RRF damping constant. 60 is the value from the original formulation and is
 #: not sensitive enough to be worth exposing as a setting.
@@ -327,10 +346,11 @@ def search(
     flat = [(chunk_id, score, sources) for chunk_id, (score, sources) in fused.items()]
     flat.sort(key=lambda item: item[1], reverse=True)
     chunks = store.chunk_rows([chunk_id for chunk_id, _, _ in flat])
+    tiered = apply_tier_prior(flat, {cid: c.tier for cid, c in chunks.items()})
     ordered = [
         (chunk_id, (score, sources))
         for chunk_id, score, sources in apply_usage_boost(
-            flat,
+            tiered,
             {chunk_id: chunk.path for chunk_id, chunk in chunks.items()},
             store.usage_map(),
         )
@@ -339,11 +359,23 @@ def search(
     hits: list[Hit] = []
     spent = 0
     truncated = 0
+    redundant = 0
+    kept_shingles: list[set[int]] = []
     for chunk_id, (score, sources) in ordered:
         if len(hits) >= limit:
             break
         chunk = chunks.get(chunk_id)
         if chunk is None:
+            continue
+        signature = shingles(chunk.body)
+        if _is_redundant(signature, kept_shingles):
+            # The same fact usually exists in several places at once - a
+            # durable note, the journal entry it came from, and the episode
+            # underneath that. Returning all of them spends the budget saying
+            # one thing, when the budget is the only thing making this
+            # affordable. Near-duplicates are dropped in favour of the next
+            # distinct passage.
+            redundant += 1
             continue
         cost = chunk.tokens or estimate_tokens(chunk.body)
         if spent + cost > budget:
@@ -352,6 +384,7 @@ def search(
             truncated += 1
             continue
         hits.append(Hit(chunk=chunk, score=score, matched_by="+".join(sorted(set(sources)))))
+        kept_shingles.append(signature)
         spent += cost
 
     if learn:
@@ -367,6 +400,7 @@ def search(
         "tokens": spent,
         "considered": len(ordered),
         "truncated": truncated,
+        "redundant": redundant,
     }
 
 

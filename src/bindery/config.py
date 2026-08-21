@@ -82,6 +82,8 @@ class Config:
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
     semantic: bool = True
     autocapture: bool = True
+    #: Import finished sessions from the other agents' transcripts.
+    episodes: bool = True
     #: Vault-relative prefixes that may be indexed. Empty means "all of it".
     include: list[str] = field(default_factory=list)
     #: Vault-relative prefixes that must never be indexed.
@@ -124,6 +126,7 @@ class Config:
             else _env_path("BINDERY_STATE_DIR") or DEFAULT_STATE_DIR
         )
         env_capture = os.environ.get("BINDERY_AUTOCAPTURE", "").strip().lower()
+        env_episodes = os.environ.get("BINDERY_EPISODES", "").strip().lower()
         env_semantic = os.environ.get("BINDERY_SEMANTIC", "").strip().lower()
         resolved_semantic = (
             semantic
@@ -139,6 +142,7 @@ class Config:
             chunk_overlap=_env_int("BINDERY_CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP),
             semantic=resolved_semantic,
             autocapture=env_capture not in {"0", "off", "false", "no"},
+            episodes=env_episodes not in {"0", "off", "false", "no"},
             include=_clean_prefixes(include) if include else _env_list("BINDERY_INCLUDE"),
             exclude=_clean_prefixes(exclude) if exclude else _env_list("BINDERY_EXCLUDE"),
             project=(

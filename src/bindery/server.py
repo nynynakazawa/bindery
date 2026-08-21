@@ -53,6 +53,10 @@ from .tokens import estimate_tokens
 #: that a long session cannot grow without bound.
 OFFERED_MEMORY = 200
 
+#: How many past sessions to import per server start. Small on purpose: the
+#: cost is paid before the first tool call, and there is always a next startup.
+EPISODES_PER_STARTUP = 5
+
 
 
 class MemoryServer:
@@ -67,6 +71,7 @@ class MemoryServer:
         # An incremental scan at startup is what keeps two agents consistent
         # when one of them edited notes while the other was not running.
         reindex(self.config, self.store)
+        self._import_episodes()
         self.session = SessionRecord(started=time.time(), ended=time.time())
         #: Which agent is on the other end, when it identifies itself during
         #: the handshake. Used only to label session records.
@@ -77,6 +82,25 @@ class MemoryServer:
         #: is what turns an impression into evidence that it was useful.
         #: Bounded because a long session must not accumulate without limit.
         self._offered: dict[str, None] = {}
+
+    def _import_episodes(self) -> None:
+        """Capture sessions the other agents finished while we were not running.
+
+        Startup rather than a daemon or an editor hook: whichever agent starts
+        next imports whatever the others left behind, so a Claude session that
+        ended overnight is searchable from Codex in the morning with nothing
+        running in between. Bounded per startup so a first run against years
+        of history cannot stall the handshake, and never fatal - failing to
+        capture the past must not stop the agent from working now.
+        """
+        if not self.config.episodes:
+            return
+        try:
+            from .episodes import import_new
+
+            import_new(self.config, self.store, limit=EPISODES_PER_STARTUP)
+        except Exception:
+            pass
 
     def _index_written(self, rel: str) -> None:
         """Bring the index up to date for the one note that just changed.
