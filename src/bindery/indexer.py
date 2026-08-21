@@ -477,5 +477,7 @@ def reindex(config: Config, store: Store, *, force: bool = False) -> IndexReport
         store.delete_note(stale)
         report.removed += 1
 
+    if store.rebuild_required:
+        store.clear_rebuild_flag()
     store.commit()
     return report

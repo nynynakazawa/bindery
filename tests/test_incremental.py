@@ -228,3 +228,27 @@ def test_refresh_embeddings_can_target_one_note(tmp_path, semantic):
 
     assert done == len(store.chunk_ids_for("a.md"))
     assert store.stats()["vectors"] == done < store.stats()["chunks"]
+
+
+def test_an_upgrade_that_resets_the_index_says_so(tmp_path):
+    """"Your vault appears to be empty" is the wrong thing to say after an upgrade."""
+    import bindery.store as store_module
+
+    config = _config(tmp_path)
+    (config.vault / "a.md").write_text("# A\n\n本文。\n", encoding="utf-8")
+    store = Store(config.db_path)
+    reindex(config, store)
+    store.close()
+
+    # A later release with a different derived schema.
+    original = store_module.SCHEMA_VERSION
+    try:
+        store_module.SCHEMA_VERSION = original + 1
+        upgraded = Store(config.db_path)
+        assert upgraded.stats()["notes"] == 0
+        assert upgraded.rebuild_required
+        reindex(config, upgraded)
+        assert upgraded.stats()["notes"] == 1
+        assert not upgraded.rebuild_required
+    finally:
+        store_module.SCHEMA_VERSION = original

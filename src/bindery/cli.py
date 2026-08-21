@@ -162,6 +162,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     problems: list[str] = []
     if not config.vault.exists():
         problems.append(f"vault does not exist: {config.vault}")
+    elif stats["notes"] == 0 and store.rebuild_required:
+        problems.append("an upgrade reset the index - run: bindery index")
     elif stats["notes"] == 0:
         problems.append(f"vault has no indexed Markdown notes: {config.vault}")
     if config.semantic and backend is None:

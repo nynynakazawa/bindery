@@ -167,6 +167,7 @@ class Store:
         self._depth = 0
         self._vec_dim: int | None = None
         self._vec = self._load_vector_extension()
+        self._pending_rebuild = False
         self._migrate()
         # Outside a transaction on purpose: sqlite3.executescript() issues an
         # implicit COMMIT before it runs, which would silently close one we
@@ -175,6 +176,8 @@ class Store:
         self.conn.executescript(_SCHEMA)
         with self.write():
             self.set_meta("schema_version", str(SCHEMA_VERSION))
+            if self._pending_rebuild:
+                self.set_meta("rebuild_required", "1")
 
     #: Columns added to `usage` after it shipped. It is the one table a schema
     #: change must not drop - retrieval history exists nowhere else and cannot
@@ -292,6 +295,10 @@ class Store:
         if row is None or str(row[0]) == str(SCHEMA_VERSION):
             return
         self._add_missing_columns()
+        # Recorded so that the next `status` can say "an upgrade reset this,
+        # run bindery index" rather than "your vault appears to be empty",
+        # which is what a user sees at the worst possible moment otherwise.
+        self._pending_rebuild = True
         for statement in (
             "DROP TABLE IF EXISTS chunks_fts",
             "DROP TABLE IF EXISTS vectors",
@@ -342,6 +349,14 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+    @property
+    def rebuild_required(self) -> bool:
+        return self.get_meta("rebuild_required") == "1"
+
+    def clear_rebuild_flag(self) -> None:
+        with self.write():
+            self.conn.execute("DELETE FROM meta WHERE key='rebuild_required'")
 
     def get_meta(self, key: str, default: str = "") -> str:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
