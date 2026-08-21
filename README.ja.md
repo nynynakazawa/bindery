@@ -168,9 +168,34 @@ bindery setup --write --include projects --include engineering
 そこでノートは所属プロジェクトを持ち、検索は既定で現在のプロジェクトと
 「どこでも当てはまる」ノートを対象にします。
 
-現在のプロジェクトは、エージェントがサーバーを起動したディレクトリの git remote
-から決まります。通常は設定不要です。`--project NAME` で上書きでき、
-`--project ""` でスコープ機能自体を無効にできます。
+ディレクトリがどのプロジェクトに属するかは、次の順で決まります。
+
+| | 判断材料 | |
+| --- | --- | --- |
+| 1 | `BINDERY_PROJECT` | 明示。1プロセス限り |
+| 2 | 上に遡って見つかる `.bindery-project` | 明示。リポジトリと一緒に移動する |
+| 3 | ワークスペースレジストリ | 明示。ツリーに何も追加しない |
+| 4 | git remote、またはリポジトリのルート | 推測 |
+| 5 | ディレクトリ名そのもの | 推測。最後の手段 |
+
+ディレクトリが入れ子になると推測だけでは足りません。`~/work/Product` と
+`~/work/Product/Sales` は1つのプロジェクトですが、後者はしばしばそれ自体が
+git リポジトリなので「Sales」という名前になります。何の営業なのか分からない
+名前であり、1階層上で記録した判断が見えない記憶になります。境界は一度だけ
+宣言してください。
+
+```bash
+bindery project add Product ~/work/Product   # 配下の Sales なども全て同じ扱いになる
+bindery project list                          # 登録内容と、いまいる場所の判定
+bindery project which ~/work/Product/Sales    # なぜそう判定されたか
+```
+
+`--marker` を付けると `.bindery-project` ファイルも書き、名前がこのマシンだけで
+なくリポジトリと一緒に移動するようになります。
+
+**ホームディレクトリは意図的にプロジェクト扱いしません。** 自分自身の名前を
+付けると何にも一致しないプロジェクトができ、そこから（つまりデスクトップアプリ
+から）の検索は毎回「該当なし」を報告して黙って全件に広がることになるためです。
 
 ノートのプロジェクトは、front matter があればそれ、無ければトップレベルの
 フォルダ名から決まります。既に「1プロジェクト1フォルダ」で整理されている Vault は、
@@ -321,6 +346,20 @@ bindery prompt [--write] [--global]
 | `BINDERY_INCLUDE`      | 未設定       | 索引するディレクトリをカンマ区切りで指定。指定するとその外は索引しません。 |
 | `BINDERY_EXCLUDE`      | 未設定       | 索引しないディレクトリをカンマ区切りで指定。 |
 | `BINDERY_PROJECT`      | 自動検出     | 検索対象とするコードベース名。空文字でスコープ無効。 |
+
+`bindery install` は、見つかった全クライアントに書き込みます。
+
+| クライアント | 設定ファイル |
+| --- | --- |
+| Claude Code — アプリ / CLI / VS Code 拡張 | `~/.claude.json` |
+| Codex — CLI / IDE拡張 / アプリ | `~/.codex/config.toml` |
+| Codex のアカウント別ホーム（`codex-multi`） | `~/.codex-homes/<アカウント>/config.toml` |
+| VS Code（Copilot エージェントモード） | `~/Library/Application Support/Code/User/mcp.json` |
+| Cursor | `~/.cursor/mcp.json` |
+
+全てを同じ Vault に向ける必要があります。漏れたエージェントは毎回何も持たない
+状態で始まります。特に見落としやすいのが Codex のアカウント別ホームで、
+`~/.codex` に登録したサーバーはそこからは一切見えません。
 
 成長まわりのチューニング値は `growth.py` に定数として置いています
 （`USAGE_HALF_LIFE_DAYS`、`USAGE_BOOST_WEIGHT`、`DUPLICATE_THRESHOLD`、

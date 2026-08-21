@@ -169,9 +169,34 @@ A decision made in one repository is not an answer about another, so notes carry
 the project they belong to and searches default to the current one plus notes
 marked as applying everywhere.
 
-The current project is the git remote of the directory the agent launched the
-server in, so nothing needs configuring in the normal case. `--project NAME`
-overrides it, and `--project ""` turns scoping off entirely.
+Which project a directory belongs to is resolved in this order:
+
+| | Source | |
+| --- | --- | --- |
+| 1 | `BINDERY_PROJECT` | explicit, for one process |
+| 2 | a `.bindery-project` file, found by walking up | explicit, travels with the repository |
+| 3 | the workspace registry | explicit, central, adds nothing to your trees |
+| 4 | the git remote, or the repository root | inferred |
+| 5 | the directory's own name | inferred, last resort |
+
+Inference alone is not enough once directories nest. `~/work/Product` and
+`~/work/Product/Sales` are one project, but the second is often its own git
+repository, so it would be called "Sales" - a name that says nothing about what
+it is the sales of, and a memory that cannot see the decisions recorded one
+level up. So name the boundary once:
+
+```bash
+bindery project add Product ~/work/Product   # everything beneath it, including Sales
+bindery project list                          # what is registered, and what you are in now
+bindery project which ~/work/Product/Sales    # and why
+```
+
+Add `--marker` to also write a `.bindery-project` file, so the name travels
+with the repository instead of living only on this machine.
+
+A home directory is deliberately no project at all. Naming it after itself
+produces a project that matches nothing, and every search from there - which is
+where a desktop app starts - would report an empty project and silently widen.
 
 Notes get their project from front matter if they have it, and from their
 top-level folder otherwise - so a vault already organised one folder per project
@@ -293,6 +318,7 @@ activity, not insight.
 ## CLI
 
 ```bash
+bindery project list             # which directories belong to which project
 bindery serve                    # MCP server on stdio (what agents launch)
 bindery index [--force] [--embed]
 bindery search "認証方式" [--limit N] [--max-tokens N] [--json]
@@ -321,6 +347,20 @@ turned into clutter.
 | `BINDERY_INCLUDE` | unset | Comma-separated directories to index, to the exclusion of all others. |
 | `BINDERY_EXCLUDE` | unset | Comma-separated directories never to index. |
 | `BINDERY_PROJECT` | detected | Name of the codebase these searches are about. Empty disables scoping. |
+
+`bindery install` writes to every client it finds:
+
+| Client | File |
+| --- | --- |
+| Claude Code — app, CLI, and VS Code extension | `~/.claude.json` |
+| Codex — CLI, IDE extension, app | `~/.codex/config.toml` |
+| Codex, per-account (`codex-multi`) | `~/.codex-homes/<account>/config.toml` |
+| VS Code, Copilot agent mode | `~/Library/Application Support/Code/User/mcp.json` |
+| Cursor | `~/.cursor/mcp.json` |
+
+Every one of them has to be pointed at the same vault, or the agents that were
+missed start each session with nothing. Per-account Codex homes are the easiest
+to overlook: a server registered in `~/.codex` is invisible from all of them.
 
 Growth tuning lives in `growth.py` as named constants - `USAGE_HALF_LIFE_DAYS`,
 `USAGE_BOOST_WEIGHT`, `DUPLICATE_THRESHOLD`, `STALE_AFTER_DAYS`,
