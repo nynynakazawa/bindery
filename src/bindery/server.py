@@ -158,6 +158,14 @@ class MemoryServer:
         while len(self._offered) > OFFERED_MEMORY:
             self._offered.pop(next(iter(self._offered)))
 
+    def _project_source(self) -> str:
+        from .workspace import resolve
+
+        try:
+            return resolve(state_dir=self.config.state_dir).describe()
+        except Exception:  # pragma: no cover - status must never fail on this
+            return "unknown"
+
     def _scope_label(self, scope: str) -> str:
         if scope == "all" or not self.config.project:
             return ""
@@ -438,6 +446,9 @@ class MemoryServer:
                 "embedded_passages": stats["vectors"],
                 "vector_index": "sqlite-vec" if self.store.ann_enabled else "exact scan",
                 "project": self.config.project or "(none - every search is global)",
+                # How that name was decided. Without it, "why is this project
+                # called Sales" needs a source dive.
+                "project_source": self._project_source(),
                 "projects_indexed": dict(self.store.projects()),
                 "indexed_only": self.config.include or "(whole vault)",
                 "never_indexed": self.config.exclude or [],

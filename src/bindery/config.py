@@ -43,50 +43,15 @@ def _clean_prefixes(values) -> list[str]:
     return cleaned
 
 
-def detect_project(start: Path | None = None) -> str:
+def detect_project(start: Path | None = None, state_dir: Path | None = None) -> str:
     """Name the codebase the agent is working in, or "" if there is no telling.
 
-    An agent's memory of "we decided to use Firebase Auth" is only true of one
-    repository, so the retrieval side needs to know which one is being asked
-    about. The MCP server is launched by the agent from the workspace, so the
-    working directory is the one signal available without configuration.
-
-    The git remote is preferred over the directory name because two checkouts
-    of the same repository - a worktree, a second clone - are the same project
-    and should share memory, while two unrelated directories that happen to be
-    named `api` are not.
+    See :mod:`bindery.workspace` for how this is decided and why it is not
+    simply the directory name.
     """
-    override = os.environ.get("BINDERY_PROJECT", "").strip()
-    if override:
-        return override
-    directory = Path(start) if start else Path.cwd()
-    try:
-        import subprocess
+    from .workspace import resolve
 
-        result = subprocess.run(
-            ["git", "-C", str(directory), "remote", "get-url", "origin"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            url = result.stdout.strip()
-            if url:
-                name = url.rstrip("/").rsplit("/", 1)[-1]
-                return name[:-4] if name.endswith(".git") else name
-        # A repository with no remote still has a root, and the root is a far
-        # better boundary than the subdirectory the agent happened to start in.
-        result = subprocess.run(
-            ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return Path(result.stdout.strip()).name
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return directory.name
+    return resolve(start, state_dir=state_dir).name
 
 
 def _env_path(name: str) -> Path | None:
@@ -176,7 +141,11 @@ class Config:
             autocapture=env_capture not in {"0", "off", "false", "no"},
             include=_clean_prefixes(include) if include else _env_list("BINDERY_INCLUDE"),
             exclude=_clean_prefixes(exclude) if exclude else _env_list("BINDERY_EXCLUDE"),
-            project=(project if project is not None else detect_project()),
+            project=(
+                project
+                if project is not None
+                else detect_project(state_dir=resolved_state)
+            ),
         )
 
 

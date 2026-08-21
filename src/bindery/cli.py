@@ -20,6 +20,7 @@ from .config import Config
 from .indexer import reindex
 from .search import search
 from .store import Store
+from .workspace import MARKER as MARKER_HINT
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -182,6 +183,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  links          {stats['links']}")
     print(f"  embedded       {stats['vectors']}")
     print(f"  max tokens     {config.max_tokens}")
+    from .workspace import resolve
+
+    print(f"  project        {resolve(state_dir=config.state_dir).describe()}")
     print(f"  semantic       {backend.name if backend else 'off (keyword only)'}")
     if backend:
         print(f"  vector index   {'sqlite-vec' if store.ann_enabled else 'exact scan'}")
@@ -610,6 +614,74 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_project(args: argparse.Namespace) -> int:
+    """Inspect and edit which directories count as which project.
+
+    Exists because the alternative - inferring it from the directory name -
+    silently splits one project into several depending on where the editor was
+    opened, and nothing in the output ever says that is what happened.
+    """
+    from .workspace import MARKER, load_registry, resolve, save_registry
+
+    config = _config_from(args)
+    state_dir = config.state_dir
+    action = args.action or "list"
+
+    if action == "which":
+        # `which PATH` puts the path in the NAME slot, since the positionals
+        # are shared with `add NAME PATH`. Accept it from either.
+        given = args.path or args.name
+        target = Path(given).expanduser() if given else Path.cwd()
+        print(f"{target}")
+        print(f"  project: {resolve(target, state_dir=state_dir).describe()}")
+        return 0
+
+    if action == "list":
+        entries = load_registry(state_dir)
+        if not entries:
+            print("No registered workspaces. Every directory falls back to git or its own name.")
+        for entry in entries:
+            print(f"  {entry['name']:<24} {entry['path']}")
+        here = resolve(Path.cwd(), state_dir=state_dir)
+        print(f"\nhere: {Path.cwd()}\n  project: {here.describe()}")
+        return 0
+
+    if action == "add":
+        if not args.name:
+            print("usage: bindery project add NAME [PATH]", file=sys.stderr)
+            return 2
+        target = Path(args.path).expanduser() if args.path else Path.cwd()
+        target = target.resolve()
+        if not target.is_dir():
+            print(f"not a directory: {target}", file=sys.stderr)
+            return 2
+        entries = [e for e in load_registry(state_dir) if Path(e["path"]) != target]
+        entries.append({"name": args.name, "path": str(target)})
+        save_registry(state_dir, entries)
+        print(f"{args.name} -> {target}")
+        if args.marker:
+            marker = target / MARKER
+            marker.write_text(args.name + "\n", encoding="utf-8")
+            print(f"wrote {marker}")
+        return 0
+
+    if action == "remove":
+        entries = load_registry(state_dir)
+        kept = [
+            e for e in entries
+            if e["name"] != args.name and Path(e["path"]) != Path(args.name).expanduser()
+        ]
+        if len(kept) == len(entries):
+            print(f"nothing registered as {args.name!r}", file=sys.stderr)
+            return 1
+        save_registry(state_dir, kept)
+        print(f"removed {args.name}")
+        return 0
+
+    print(f"unknown action: {action}", file=sys.stderr)
+    return 2
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     """Print - or apply - client configuration.
 
@@ -769,6 +841,22 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Configure Claude Code for this directory only (./.mcp.json) "
                               "instead of globally.")
     p_setup.set_defaults(func=cmd_setup)
+
+    p_project = sub.add_parser(
+        "project", help="Show or set which directories belong to which project."
+    )
+    _add_common(p_project)
+    p_project.add_argument(
+        "action", nargs="?", choices=["list", "which", "add", "remove"], default="list",
+        help="list (default), which PATH, add NAME [PATH], remove NAME",
+    )
+    p_project.add_argument("name", nargs="?", help="Project name, for add/remove.")
+    p_project.add_argument("path", nargs="?", help="Directory. Defaults to the current one.")
+    p_project.add_argument(
+        "--marker", action="store_true",
+        help=f"Also write a {MARKER_HINT} file, so the name travels with the repository.",
+    )
+    p_project.set_defaults(func=cmd_project)
 
     p_prompt = sub.add_parser("prompt", help="Print the agent instructions that make the memory grow.")
     p_prompt.add_argument("--write", action="store_true",
