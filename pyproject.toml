@@ -19,22 +19,24 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries",
 ]
-# The official MCP SDK, and nothing else. The protocol layer used to be
-# hand-written to keep this list empty, which bought one fewer dependency at
-# the price of owning the fastest-moving and least project-specific part of
-# the system - negotiation, error semantics, and every future revision of the
-# wire format. The SDK is a subprocess dependency of an agent that already
-# ships far heavier ones, so the trade no longer paid.
-dependencies = ["mcp>=2,<3"]
+# Everything needed for the one supported configuration. Semantic search used
+# to be an extra, which meant the documented install produced a system that
+# retrieved worse than the one described in the README, and the user had to
+# know that to fix it. There is one way this works, and it works after one
+# command.
+#
+# sqlite-vec is pinned tightly on purpose: it is pre-1.0, and the index it
+# builds lives in the user's database.
+dependencies = [
+  "mcp>=2,<3",
+  "fastembed>=0.4",
+  "sqlite-vec>=0.1.6,<0.2",
+]
 
 [project.optional-dependencies]
-# Semantic search. Optional because these wheels are large and the keyword
-# index is a complete, working system on its own.
-# sqlite-vec turns the vector search from a scan of every embedding into a
-# nearest-neighbour query in the same database file. Bundled with the extra
-# rather than required, because the exact scan is still correct without it -
-# and some Python builds cannot load SQLite extensions at all.
-semantic = ["fastembed>=0.4", "sqlite-vec>=0.1.6"]
+# Kept so that `pip install 'bindery-mcp[semantic]'` from older instructions
+# still resolves. Semantic search is no longer optional; this is now a no-op.
+semantic = []
 dev = ["pytest>=8"]
 
 [project.urls]

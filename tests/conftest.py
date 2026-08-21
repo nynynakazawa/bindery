@@ -21,6 +21,10 @@ def no_real_sessions(monkeypatch):
     and turn it back on.
     """
     monkeypatch.setenv("BINDERY_EPISODES", "0")
+    # And off the real embedding model: loading it is seconds of ONNX startup
+    # per process, and tests that care about ranking supply a deterministic
+    # stand-in instead.
+    monkeypatch.setenv("BINDERY_SEMANTIC", "0")
 
 
 @pytest.fixture

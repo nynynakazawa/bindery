@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass
 
 from .config import Config
-from .embed import cosine, load_backend
+from .embed import cosine
 from .growth import apply_tier_prior, apply_usage_boost, shingles
 from .store import Chunk, Store, unpack_vector
 from .tokens import estimate_tokens
@@ -270,6 +270,11 @@ ANN_OVERFETCH = 8
 def _semantic_ranking(
     store: Store, query: str, depth: int, scope_sql: str = "", scope_params: list | None = None
 ) -> list[int]:
+    # Imported here rather than at module scope so that a caller replacing
+    # `bindery.embed.load_backend` replaces it everywhere - it is the seam
+    # tests use, and one module holding its own reference silently opted out.
+    from .embed import load_backend
+
     backend = load_backend()
     if backend is None:
         return []

@@ -17,19 +17,24 @@ from bindery.store import Store
 
 
 class DirectionalBackend:
-    """Embeds on one axis per keyword, so nearest-neighbour order is knowable."""
+    """Embeds on one axis per keyword, so nearest-neighbour order is knowable.
+
+    The axes overlap slightly on purpose. Orthogonal vectors would make every
+    non-matching note equidistant, and comparing two rankings of tied scores
+    tests the tie-break rather than the index.
+    """
 
     name = "directional"
     dim = 3
 
+    #: Deliberately distinct similarities, so ordering is total.
+    _AXES = {"りんご": (1.0, 0.3, 0.0), "みかん": (0.3, 1.0, 0.2), "ぶどう": (0.0, 0.2, 1.0)}
+
     def encode(self, texts):
         vectors = []
         for text in texts:
-            vectors.append([
-                1.0 if "りんご" in text else 0.0,
-                1.0 if "みかん" in text else 0.0,
-                1.0 if "ぶどう" in text else 0.0,
-            ])
+            found = next((v for k, v in self._AXES.items() if k in text), (0.1, 0.1, 0.1))
+            vectors.append(list(found))
         return vectors
 
 

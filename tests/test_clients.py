@@ -169,3 +169,28 @@ def test_the_index_boundary_reaches_every_client(config, home):
     assert vscode["servers"]["bindery"]["env"]["BINDERY_INCLUDE"] == "work"
     body = (home / ".codex-homes" / "codexb" / "config.toml").read_text(encoding="utf-8")
     assert 'BINDERY_INCLUDE = "work"' in body
+
+
+# ---------------------------------------------------- installing selectively
+
+
+def test_an_agent_that_is_not_installed_is_left_alone(config, tmp_path, monkeypatch):
+    """Creating a config for an app the user does not have is litter."""
+    bare = tmp_path / "bare"
+    (bare / ".claude").mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: bare)
+
+    main(["install", "--write", "--vault", str(config.vault)])
+
+    assert (bare / ".claude.json").exists()
+    assert not (bare / ".cursor" / "mcp.json").exists()
+
+
+def test_naming_a_client_installs_it_anyway(config, tmp_path, monkeypatch):
+    """For setting Bindery up before the agent."""
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: bare)
+
+    main(["install", "cursor", "--write", "--vault", str(config.vault)])
+    assert (bare / ".cursor" / "mcp.json").exists()

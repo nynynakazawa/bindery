@@ -17,10 +17,13 @@ from pathlib import Path
 
 from . import __version__
 from .config import Config
-from .indexer import reindex
+from .episodes import set_baseline
+from .indexer import index_path, reindex
 from .search import search
+from .safeio import update_text
 from .store import Store
 from .workspace import MARKER as MARKER_HINT
+from .workspace import resolve as resolve_project
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -280,10 +283,20 @@ It is not scratch space - what you write, the next session reads.
   any of these is true:
   - you made a design decision, or rejected an alternative, and why
   - you found a constraint that is not obvious from the code
-  - you hit a dead end worth not repeating
   - a fix worked and the reason was not self-evident
   Always pass `tags`. Tags are what let a recurring topic graduate into a
   durable note of its own.
+- **Record what failed, not only what worked.** A dead end is worth more than
+  a success, because nothing in the repository records it and the next session
+  will otherwise spend the same hours on it. Write down what was attempted,
+  the error or behaviour you actually observed, the root cause if you found
+  one, and what you did instead.
+- **When a decision changes, update the note that stated it** - do not add a
+  second note saying the opposite. Search first, edit the existing durable
+  note with `memory_write`, and let the journal keep the history. Two live
+  notes disagreeing is how a memory starts giving wrong answers confidently.
+- **Never record credentials, tokens, keys, or personal data**, even in
+  passing, and even inside a quoted command or error message.
 - **Do not** record routine progress, restatements of the code, or anything
   you could recover by reading the repository. Noise costs the same tokens as
   signal and crowds it out.
@@ -291,6 +304,10 @@ It is not scratch space - what you write, the next session reads.
   running record of what a session figured out.
 - Both record the current project automatically. Pass `project=""` when what
   you learned is true regardless of which codebase you are in.
+- Finished sessions are captured automatically, so nothing is lost if you
+  forget - but a captured transcript is a record of what happened, not a
+  conclusion. Results marked as coming from a session are weaker evidence than
+  a note somebody wrote, and should be confirmed before being acted on.
 """
 
 
@@ -702,8 +719,13 @@ def cmd_install(args: argparse.Namespace) -> int:
         spec = targets[client]
         if index:
             print()
-        seen = " (detected)" if client in detected else " (not detected on this machine)"
-        print(f"# {spec['label']}{seen} - {spec['scope']} scope - {spec['path']}")
+        if client not in detected and not args.client:
+            # Writing a config for an agent that is not installed leaves
+            # litter for something the user may never run. Naming the client
+            # explicitly still forces it, for installing ahead of the agent.
+            print(f"# {spec['label']} - not installed on this machine, skipped")
+            continue
+        print(f"# {spec['label']} - {spec['scope']} scope - {spec['path']}")
         print()
         print(_render_target(spec))
         if args.write:
@@ -724,42 +746,72 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    """Do every setup step in one pass.
+    """Do every setup step in one pass, and prove it worked.
 
-    Defaults to a dry run. The prompt step edits the agent policy files in your
-    home directory, which are usually hand-maintained and long, so showing what
-    will be touched before touching it is the right default.
+    The measure of this command is that nothing is left for the user to decide
+    afterwards: no retrieval mode to pick, no embedding model to fetch, no
+    per-agent configuration to repeat, and no way to end up with a working
+    install that quietly retrieves worse than the one in the README.
+
+    Defaults to a dry run, because the instructions step edits the agent policy
+    files in your home directory - usually long and hand-maintained.
     """
     config = _config_from(args)
     mode = "APPLYING" if args.write else "DRY RUN - nothing will be written"
     print(f"bindery setup ({mode})")
-    print(f"  vault: {config.vault}")
+    print(f"  vault:   {config.vault}")
+    print(f"  project: {resolve_project(state_dir=config.state_dir).describe()}")
 
-    print("\n[1/3] index")
+    steps = 5
+    print(f"\n[1/{steps}] semantic search")
+    if not config.semantic:
+        print("  turned off (BINDERY_SEMANTIC=0 or --no-semantic) - keyword search only")
+    elif args.write:
+        _prepare_semantic(config)
+    else:
+        print("  would download the embedding model on first use (~220MB, once)")
+
+    print(f"\n[2/{steps}] index")
+    store = None
     if args.write:
         store = Store(config.db_path)
         report = reindex(config, store)
-        store.close()
         print(f"  {report.scanned} note(s) scanned, {report.added} added, {report.updated} updated")
+        embedded = _embed_missing(config, store)
+        if embedded:
+            print(f"  {embedded} passage(s) embedded")
+        if store.ann_enabled:
+            store.rebuild_vector_index()
     else:
         print(f"  would index {config.vault}")
 
-    print("\n[2/3] MCP server configuration")
+    print(f"\n[3/{steps}] session capture")
+    if args.write:
+        seen = set_baseline(config)
+        print(f"  {seen} existing session(s) marked as history and left alone")
+        print("  new sessions will be captured as they finish")
+    else:
+        print("  would record existing sessions as a baseline and capture only new ones")
+
+    print(f"\n[4/{steps}] MCP server configuration")
     targets = _client_targets(config, "project" if args.local else "user")
     detected = _detect_clients()
     for client in sorted(targets):
         spec = targets[client]
-        mark = "detected" if client in detected else "not detected"
+        if client not in detected:
+            # Creating a config file for an agent that is not installed leaves
+            # litter in a home directory for something the user may never use.
+            # Naming the client explicitly still forces it.
+            print(f"  {spec['label']}: not installed - skipped")
+            continue
         if args.write:
-            result = _write_target(spec)
-            print(f"  {spec['label']} ({mark}): {result}")
+            print(f"  {spec['label']}: {_write_target(spec)}")
         else:
-            print(f"  {spec['label']} ({mark}): would write {spec['path']} [{spec['scope']} scope]")
+            print(f"  {spec['label']}: would write {spec['path']} [{spec['scope']} scope]")
 
-    print("\n[3/3] agent instructions (this is the step that makes anything get recorded)")
+    print(f"\n[5/{steps}] agent instructions (this is the step that makes anything get recorded)")
     if args.write:
-        prompt_args = argparse.Namespace(write=True, user=True)
-        cmd_prompt(prompt_args)
+        cmd_prompt(argparse.Namespace(write=True, user=True))
     else:
         for relative in PROMPT_TARGETS["user"]:
             target = Path.home() / relative
@@ -768,9 +820,89 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     if not args.write:
         print("\nRe-run with --write to apply. Existing files are backed up, never replaced.")
-    else:
-        print("\nDone. Restart your agents so they pick up the new configuration.")
-    return 0
+        return 0
+
+    ok = _health_check(config, store)
+    if store is not None:
+        store.close()
+    print("\nRestart your agents so they pick up the new configuration.")
+    return 0 if ok else 1
+
+
+def _prepare_semantic(config: Config) -> None:
+    """Fetch the embedding model now rather than during the first search.
+
+    Downloading it lazily would mean the first question an agent asks takes a
+    couple of minutes, with no indication of why.
+    """
+    from .embed import load_backend
+
+    print("  fetching the embedding model if it is not already cached…")
+    backend = load_backend()
+    if backend is None:
+        print("  ! no embedding backend available - keyword search will still work")
+        return
+    print(f"  {backend.name}: {getattr(backend, 'model_name', 'ready')} ({backend.dim} dims)")
+
+
+def _health_check(config: Config, store: Store | None) -> bool:
+    """Prove the thing works, rather than reporting that it was configured.
+
+    Writing a note and finding it again exercises the whole path - locking,
+    atomic write, indexing, embedding, and retrieval - which is the only claim
+    worth making at the end of an install.
+    """
+    print("\nchecking:")
+    owned = store is None
+    store = store or Store(config.db_path)
+    problems: list[str] = []
+
+    probe_rel = "journal/.bindery-healthcheck.md"
+    probe = config.vault / probe_rel
+    try:
+        update_text(
+            probe,
+            lambda _c: "---\nproject: \n---\n\n# health check\n\n"
+                       "bindery-healthcheck-token 疎通確認\n",
+            lock_dir=config.state_dir,
+        )
+        index_path(config, store, probe)
+        hits, _ = search(config, store, "bindery-healthcheck-token", learn=False, scope="all")
+        print(f"  write and retrieve   {'ok' if hits else 'FAILED'}")
+        if not hits:
+            problems.append("wrote a note but could not retrieve it")
+    except Exception as exc:
+        print(f"  write and retrieve   FAILED ({type(exc).__name__})")
+        problems.append(str(exc))
+    finally:
+        probe.unlink(missing_ok=True)
+        store.delete_note(probe_rel)
+        store.commit()
+
+    from .embed import load_backend
+
+    backend = load_backend() if config.semantic else None
+    print(f"  semantic search      {backend.name if backend else 'off (keyword only)'}")
+    print(f"  vector index         {'sqlite-vec' if store.ann_enabled else 'exact scan'}")
+
+    stats = store.stats()
+    unembedded = stats["chunks"] - stats["vectors"]
+    if backend and unembedded > 0:
+        print(f"  ! {unembedded} passage(s) not embedded - run: bindery index --embed")
+
+    clients = sorted(_detect_clients())
+    print(f"  agents configured    {', '.join(clients) if clients else 'none detected'}")
+    print(f"  indexed              {stats['notes']} note(s), {stats['chunks']} passage(s)")
+
+    if owned:
+        store.close()
+    if problems:
+        for problem in problems:
+            print(f"  ! {problem}")
+        print("\nBindery is NOT ready.")
+        return False
+    print("\nBindery is ready. Memory will now maintain itself.")
+    return True
 
 
 def build_parser() -> argparse.ArgumentParser:
