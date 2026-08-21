@@ -598,6 +598,51 @@ PROMPT_TARGETS = {
 }
 
 
+#: Markers around the block Bindery owns, so that improving the instructions
+#: reaches installs that already have an older version. Without them the only
+#: safe move was to leave an existing block alone - which meant every
+#: improvement to the one mechanism that makes anything get recorded applied
+#: to new users only.
+BLOCK_BEGIN = "<!-- bindery:begin - managed by `bindery prompt`, edits will be replaced -->"
+BLOCK_END = "<!-- bindery:end -->"
+
+#: The heading of blocks written before the markers existed.
+LEGACY_HEADING = "## Shared memory (Bindery)"
+
+
+def _managed_block() -> str:
+    return f"{BLOCK_BEGIN}\n{AGENT_INSTRUCTIONS.strip()}\n{BLOCK_END}\n"
+
+
+def _apply_instructions(current: str) -> tuple[str, str]:
+    """Insert or refresh the block, leaving everything around it alone.
+
+    Returns the new text and what happened, so the caller can say so.
+    """
+    block = _managed_block()
+    if BLOCK_BEGIN in current and BLOCK_END in current:
+        start = current.index(BLOCK_BEGIN)
+        end = current.index(BLOCK_END) + len(BLOCK_END)
+        tail = current[end:].lstrip("\n")
+        rebuilt = current[:start] + block + ("\n" + tail if tail else "")
+        return rebuilt, "unchanged" if rebuilt == current else "updated"
+
+    if LEGACY_HEADING in current:
+        # Written before the markers. The block runs to the next heading of
+        # the same level, or to the end of the file - it contains none of its
+        # own, so this cannot swallow anything that was not ours.
+        start = current.index(LEGACY_HEADING)
+        rest = current[start + len(LEGACY_HEADING):]
+        offset = rest.find("\n## ")
+        end = len(current) if offset == -1 else start + len(LEGACY_HEADING) + offset + 1
+        tail = current[end:].lstrip("\n")
+        rebuilt = current[:start] + block + ("\n" + tail if tail else "")
+        return rebuilt, "updated"
+
+    prefix = "" if not current else ("\n" if current.endswith("\n") else "\n\n")
+    return current + prefix + block, "added"
+
+
 def cmd_prompt(args: argparse.Namespace) -> int:
     """Emit the agent instructions that make the memory actually accumulate."""
     if not args.write:
@@ -613,16 +658,16 @@ def cmd_prompt(args: argparse.Namespace) -> int:
             print(f"- {target}: parent directory missing - skipped.")
             continue
         current = target.read_text(encoding="utf-8") if target.exists() else ""
-        if "Shared memory (Bindery)" in current:
-            print(f"- {target}: already has the block - left untouched.")
+        updated, action = _apply_instructions(current)
+        if action == "unchanged":
+            print(f"- {target}: already up to date.")
             continue
         if current:
             # These files often hold a lot of hand-written policy. Never edit
             # one without leaving the previous version recoverable.
             target.with_suffix(target.suffix + ".bak").write_text(current, encoding="utf-8")
-        prefix = "" if not current else ("\n" if current.endswith("\n") else "\n\n")
-        target.write_text(current + prefix + AGENT_INSTRUCTIONS, encoding="utf-8")
-        written.append(str(target))
+        target.write_text(updated, encoding="utf-8")
+        written.append(f"{target} ({action})")
 
     if written:
         print("appended to:")

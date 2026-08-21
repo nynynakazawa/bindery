@@ -442,3 +442,68 @@ def test_install_points_at_the_global_prompt_command(capsys, config):
     out = capsys.readouterr().out
     assert "prompt --global --write" in out
     assert "setup --write" in out
+
+
+# ------------------------------------------------- keeping instructions current
+
+
+def test_an_older_block_is_replaced_not_duplicated(tmp_path, monkeypatch):
+    """The instructions are the mechanism; improving them has to reach people."""
+    from bindery.cli import LEGACY_HEADING, _apply_instructions
+
+    hand_written = "# My policy\n\nSomething I wrote.\n\n"
+    stale = f"{LEGACY_HEADING}\n\nOld and wrong instructions.\n"
+    updated, action = _apply_instructions(hand_written + stale)
+
+    assert action == "updated"
+    assert "Old and wrong instructions" not in updated
+    assert updated.count("Shared memory (Bindery)") == 1
+    assert updated.startswith(hand_written)
+
+
+def test_replacing_a_block_keeps_what_follows_it(tmp_path):
+    from bindery.cli import LEGACY_HEADING, _apply_instructions
+
+    before = "# Mine\n\nfirst\n\n"
+    after = "## My own later section\n\nkeep me\n"
+    updated, _ = _apply_instructions(f"{before}{LEGACY_HEADING}\n\nstale\n\n{after}")
+
+    assert "keep me" in updated
+    assert "My own later section" in updated
+    assert "stale" not in updated
+
+
+def test_the_block_is_added_when_absent(tmp_path):
+    from bindery.cli import _apply_instructions
+
+    updated, action = _apply_instructions("# Mine\n\ncontent\n")
+    assert action == "added"
+    assert "Shared memory (Bindery)" in updated
+    assert updated.startswith("# Mine")
+
+
+def test_reapplying_an_unchanged_block_is_a_no_op(tmp_path):
+    from bindery.cli import _apply_instructions
+
+    once, _ = _apply_instructions("# Mine\n\ncontent\n")
+    twice, action = _apply_instructions(once)
+
+    assert action == "unchanged"
+    assert twice == once
+
+
+def test_writing_the_prompt_twice_leaves_one_block(tmp_path, monkeypatch, capsys):
+    from bindery.cli import main
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir(parents=True)
+    (home / ".claude" / "CLAUDE.md").write_text("# Policy\n\nmine\n", encoding="utf-8")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    main(["prompt", "--global", "--write"])
+    main(["prompt", "--global", "--write"])
+
+    body = (home / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+    assert body.count("Shared memory (Bindery)") == 1
+    assert body.startswith("# Policy")
