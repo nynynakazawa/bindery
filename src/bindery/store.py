@@ -629,6 +629,16 @@ class Store:
         allowed = {int(r["id"]) for r in rows}
         return [chunk_id for chunk_id in chunk_ids if chunk_id in allowed]
 
+    def vectors_for(self, chunk_ids: list[int]):
+        """The stored vectors for specific chunks, in no particular order."""
+        if not chunk_ids:
+            return []
+        marks = ",".join("?" * len(chunk_ids))
+        return self.conn.execute(
+            f"SELECT chunk_id, dim, vec FROM vectors WHERE chunk_id IN ({marks})",
+            chunk_ids,
+        ).fetchall()
+
     def projects(self) -> list[tuple[str, int]]:
         """Every project the vault knows about, with note counts."""
         return [

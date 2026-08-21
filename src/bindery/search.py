@@ -37,11 +37,19 @@ from .tokens import estimate_tokens
 RESULT_DUPLICATE_THRESHOLD = 0.7
 
 
+#: Passages with fewer distinct shingles than this are not compared at all.
+#: Containment over a small signature is meaningless - two unrelated short
+#: notes share most of their few shingles by chance, and suppressing on that
+#: throws away correct answers. Discovered by the benchmark, which showed a
+#: single query dropping two dozen passages as "duplicates".
+MIN_SHINGLES_FOR_SUPPRESSION = 12
+
+
 def _is_redundant(signature: set[int], kept: list[set[int]]) -> bool:
-    if not signature:
+    if len(signature) < MIN_SHINGLES_FOR_SUPPRESSION:
         return False
     for other in kept:
-        if not other:
+        if len(other) < MIN_SHINGLES_FOR_SUPPRESSION:
             continue
         overlap = len(signature & other)
         if overlap / min(len(signature), len(other)) >= RESULT_DUPLICATE_THRESHOLD:
@@ -266,6 +274,9 @@ def _keyword_rankings(
 #: scoped search from coming back short.
 ANN_OVERFETCH = 8
 
+#: How close a vector has to be before it counts as a match at all.
+MIN_SIMILARITY = 0.30
+
 
 def _semantic_ranking(
     store: Store, query: str, depth: int, scope_sql: str = "", scope_params: list | None = None
@@ -285,18 +296,28 @@ def _semantic_ranking(
 
     approximate = store.nearest_vectors(query_vec, depth * ANN_OVERFETCH)
     if approximate is not None:
-        return store.filter_chunks_in_scope(approximate, scope_sql, scope_params)[:depth]
-
-    # No ANN index: compare against every vector. Correct, and linear in the
-    # size of the vault - fine for a personal collection, and the reason the
-    # index above is worth having when it is available.
-    rows = store.all_vectors(scope_sql, scope_params)
+        in_scope = store.filter_chunks_in_scope(approximate, scope_sql, scope_params)
+        rows = store.vectors_for(in_scope)
+    else:
+        # No ANN index: compare against every vector. Correct, and linear in
+        # the size of the vault - fine for a personal collection, and the
+        # reason the index above is worth having when it is available.
+        rows = store.all_vectors(scope_sql, scope_params)
     if not rows:
         return []
+
     scored = [
         (int(r["chunk_id"]), cosine(query_vec, unpack_vector(r["vec"], int(r["dim"]))))
         for r in rows
     ]
+    # A nearest neighbour is not necessarily a neighbour. Cosine always has a
+    # best match, so without a floor the vector ranking answers every question
+    # - including ones the memory has nothing to say about - and it answers
+    # them with the same confidence as a real match. Measured on the benchmark
+    # corpus, unrelated text tops out around 0.24 while a genuine match sits
+    # above 0.40, so anything under the floor is contributing noise to the
+    # fusion rather than a candidate.
+    scored = [pair for pair in scored if pair[1] >= MIN_SIMILARITY]
     scored.sort(key=lambda pair: pair[1], reverse=True)
     return [chunk_id for chunk_id, _ in scored[:depth]]
 
