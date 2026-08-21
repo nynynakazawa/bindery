@@ -194,3 +194,18 @@ def test_naming_a_client_installs_it_anyway(config, tmp_path, monkeypatch):
 
     main(["install", "cursor", "--write", "--vault", str(config.vault)])
     assert (bare / ".cursor" / "mcp.json").exists()
+
+
+def test_the_health_check_writes_inside_the_index_boundary(config, home, capsys):
+    """Otherwise a correctly-working allowlist reports itself as a failure."""
+    from bindery.cli import main
+
+    (config.vault / "work").mkdir()
+    (config.vault / "work" / "a.md").write_text("# A\n\n本文。\n", encoding="utf-8")
+
+    main(["setup", "--write", "--vault", str(config.vault),
+          "--include", "work", "--no-semantic", "--state-dir", str(config.state_dir)])
+
+    out = capsys.readouterr().out
+    assert "write and retrieve   ok" in out
+    assert "Bindery is ready" in out

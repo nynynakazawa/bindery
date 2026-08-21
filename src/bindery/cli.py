@@ -105,6 +105,8 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 def _embed_missing(config: Config, store: Store) -> int:
     """Fill in vectors for passages that do not have one yet."""
+    if not config.semantic:
+        return 0
     from .embed import load_backend
 
     backend = load_backend()
@@ -857,7 +859,10 @@ def _health_check(config: Config, store: Store | None) -> bool:
     store = store or Store(config.db_path)
     problems: list[str] = []
 
-    probe_rel = "journal/.bindery-healthcheck.md"
+    # Inside the boundary, or the probe is correctly not indexed and the check
+    # reports a failure that is really a working allowlist.
+    home_dir = config.include[0] if config.include else "journal"
+    probe_rel = f"{home_dir}/.bindery-healthcheck.md"
     probe = config.vault / probe_rel
     try:
         update_text(
