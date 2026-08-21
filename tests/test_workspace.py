@@ -184,3 +184,24 @@ def test_project_which_explains_itself(tmp_path, state, capsys):
     main(["project", "which", str(root / "deep"), "--state-dir", str(state)])
     out = capsys.readouterr().out
     assert "gakuwari" in out and "registry" in out
+
+
+def test_a_home_directory_is_not_a_project(tmp_path, state, monkeypatch):
+    """It named itself, matched nothing, and every search silently widened."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
+
+    result = resolve(fake_home, state_dir=state)
+    assert result.name == ""
+    assert "not a project" in result.source
+
+
+def test_a_registered_home_still_wins(tmp_path, state, monkeypatch):
+    """The rule is a fallback, not a veto on what the user said."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
+    save_registry(state, [{"name": "personal", "path": str(fake_home)}])
+
+    assert resolve(fake_home, state_dir=state).name == "personal"

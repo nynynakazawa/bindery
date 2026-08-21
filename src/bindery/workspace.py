@@ -188,4 +188,11 @@ def resolve(start: Path | None = None, *, state_dir: Path | None = None) -> Reso
     from_git = _from_git(directory)
     if from_git:
         return from_git
+    if directory == Path.home().resolve():
+        # A home directory is not a project. Naming it after itself produced a
+        # project called "nakazawa" that matched no notes at all - so every
+        # search started from there, which is where the desktop app starts,
+        # reported an empty project and fell back to the whole vault. Being
+        # unscoped is the honest answer, and it is also the useful one.
+        return Resolution("", "home directory is not a project", str(directory))
     return Resolution(directory.name, "directory name", str(directory))
