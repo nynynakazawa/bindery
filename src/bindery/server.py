@@ -243,12 +243,16 @@ class MemoryServer:
         project = args.get("project")
         project = self.config.project if project is None else str(project).strip()
 
+        # `project` is written whenever the caller said anything about it,
+        # including an empty string - that is how a note is marked as applying
+        # everywhere rather than to the folder it happens to sit in.
+        declare_project = args.get("project") is not None or bool(project)
         front: list[str] = []
-        if title or tags or project:
+        if title or tags or declare_project:
             front.append("---")
             if title:
                 front.append(f"title: {title}")
-            if project:
+            if declare_project:
                 front.append(f"project: {project}")
             if tags:
                 front.append("tags: [" + ", ".join(str(t) for t in tags) + "]")

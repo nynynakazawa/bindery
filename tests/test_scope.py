@@ -135,15 +135,27 @@ def test_writes_record_the_current_project(vault, tmp_path):
 
 
 def test_a_write_can_opt_out_of_the_project(vault, tmp_path):
+    """Filed in a folder, and still global - the folder must not re-scope it."""
     server = MemoryServer(_config(vault, tmp_path, project="alpha"))
-    _call(server, "memory_write", {"path": "style.md", "content": "早期returnを好む。", "project": ""})
+    _call(server, "memory_write", {
+        "path": "conventions/style.md", "content": "早期returnを好む。", "project": "",
+    })
 
-    body = (vault / "style.md").read_text(encoding="utf-8")
-    assert "project:" not in body
+    body = (vault / "conventions" / "style.md").read_text(encoding="utf-8")
+    assert "project:" in body
 
     other = MemoryServer(_config(vault, tmp_path, project="beta"))
     text, _ = _call(other, "memory_search", {"query": "早期return"})
     assert "早期return" in text
+
+
+def test_an_explicitly_empty_project_beats_the_folder(vault, tmp_path):
+    _note(vault, "TimeMachine/backup.md", "バックアップ失敗の原因は除外設定。", project="")
+
+    server = MemoryServer(_config(vault, tmp_path, project="whatever"))
+    text, _ = _call(server, "memory_search", {"query": "バックアップ"})
+    assert "除外設定" in text
+    assert "[global]" in text
 
 
 def test_journals_are_kept_per_project(vault, tmp_path):

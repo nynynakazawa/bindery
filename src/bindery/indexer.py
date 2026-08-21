@@ -87,10 +87,13 @@ def project_of(rel: str, meta: dict[str, str] | None = None, include=()) -> str:
     project called "work", but naming ``work`` as the indexed directory has
     already said that it is a container rather than a project.
     """
-    if meta:
-        declared = str(meta.get("project", "")).strip()
-        if declared:
-            return declared
+    if meta and "project" in meta:
+        # Present-but-empty is an explicit "this applies everywhere", which is
+        # different from absent. Without the distinction a note deliberately
+        # marked global would be re-scoped to whatever folder it was filed in,
+        # and there would be no way to keep cross-cutting knowledge anywhere
+        # but the vault root.
+        return str(meta["project"]).strip()
     rel = rel.replace("\\", "/")
     for prefix in sorted(include, key=len, reverse=True):
         prefix = prefix.replace("\\", "/").strip("/")
@@ -113,7 +116,8 @@ class ParsedNote:
     tags: list[str]
     body: str
     links: list[str] = field(default_factory=list)
-    project: str = ""
+    #: None when the note declares nothing; "" when it declares itself global.
+    project: str | None = None
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -160,7 +164,7 @@ def parse_note(path: Path, text: str) -> ParsedNote:
     links = sorted({m.group(1).strip() for m in WIKILINK_RE.finditer(text)})
     return ParsedNote(
         title=title, tags=tags, body=body, links=links,
-        project=str(meta.get("project", "")).strip(),
+        project=str(meta["project"]).strip() if "project" in meta else None,
     )
 
 
@@ -342,7 +346,11 @@ def _write_note(config: Config, store: Store, path: Path, rel: str, text: str, d
         path=rel,
         title=note.title,
         tags=note.tags,
-        project=project_of(rel, {"project": note.project}, include=config.include),
+        project=project_of(
+            rel,
+            None if note.project is None else {"project": note.project},
+            include=config.include,
+        ),
         mtime=path.stat().st_mtime,
         digest=digest,
         chunks=chunks,
