@@ -859,10 +859,8 @@ def _health_check(config: Config, store: Store | None) -> bool:
     store = store or Store(config.db_path)
     problems: list[str] = []
 
-    # Inside the boundary, or the probe is correctly not indexed and the check
-    # reports a failure that is really a working allowlist.
-    home_dir = config.include[0] if config.include else "journal"
-    probe_rel = f"{home_dir}/.bindery-healthcheck.md"
+    # journal/ is always indexed, allowlist or not - it is Bindery's own area.
+    probe_rel = "journal/.bindery-healthcheck.md"
     probe = config.vault / probe_rel
     try:
         update_text(

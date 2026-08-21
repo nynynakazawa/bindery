@@ -321,3 +321,26 @@ def test_an_indexed_container_directory_is_not_the_project(vault, tmp_path):
     assert "Firebase" in text
     assert "Clerk" not in text
     assert "[alpha]" in text
+
+
+def test_an_allowlist_does_not_silence_binderys_own_writes(vault, tmp_path):
+    """The recommended setup would otherwise capture nothing, ever.
+
+    `--include work` names which of the user's directories to index. Applying
+    it to journal/ too would mean every session Bindery captured was written
+    and then never indexed.
+    """
+    server = MemoryServer(_config(vault, tmp_path, project="alpha", include=["work"]))
+    _call(server, "memory_learn", {"content": "WAL は busy_timeout より先に設定する。", "tags": ["db"]})
+
+    text, _ = _call(server, "memory_search", {"query": "busy_timeout", "scope": "all"})
+    assert "WAL" in text
+
+
+def test_journal_can_still_be_excluded_explicitly(vault, tmp_path):
+    _note(vault, "journal/alpha/2026-08-20.md", "WAL のロックで詰まった。", project="alpha")
+    server = MemoryServer(
+        _config(vault, tmp_path, project="alpha", include=["work"], exclude=["journal"])
+    )
+    text, _ = _call(server, "memory_search", {"query": "ロックで詰まった", "scope": "all"})
+    assert "WAL" not in text

@@ -44,6 +44,9 @@ SKIP_PREFIXES = ("journal/sessions/",)
 #: because their whole purpose is to be findable.
 EPISODE_PREFIX = "journal/episodes/"
 
+#: Everything Bindery writes on its own lives here.
+MANAGED_PREFIX = "journal/"
+
 #: What a passage is, which is not the same as how relevant it is.
 #:
 #: A durable note states what is currently true. A journal entry states what
@@ -103,7 +106,13 @@ def is_indexable(rel: str, *, include=(), exclude=()) -> bool:
         return False
     if any(_under(rel, prefix) for prefix in exclude):
         return False
-    if include:
+    if include and not _under(rel, MANAGED_PREFIX.rstrip("/")):
+        # `include` names which of the *user's* directories to index. Applying
+        # it to Bindery's own area as well would mean that the recommended
+        # setup for an existing Obsidian vault - name the work directories,
+        # leave the rest alone - silently prevented anything Bindery wrote
+        # from ever being indexed, including every captured session. Excluding
+        # `journal` explicitly still turns it off.
         return any(_under(rel, prefix) for prefix in include)
     return True
 
