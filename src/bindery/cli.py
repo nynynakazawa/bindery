@@ -81,7 +81,27 @@ def _add_project(parser: argparse.ArgumentParser, *, suppress_defaults: bool = F
     )
 
 
+def _vault_from_registered_clients() -> str | None:
+    """The vault every registered client agrees on, if exactly one.
+
+    Apps launched from Finder (Bindery.app) and plain shells do not inherit
+    BINDERY_VAULT, but the client configs written by `install` record it.
+    When they all name the same vault, that is the user's vault.
+    """
+    try:
+        probe = Config.resolve()
+        vaults = {v for v in (_registered_vault(spec) for spec in _client_targets(probe, "user").values()) if v}
+    except Exception:
+        return None
+    return vaults.pop() if len(vaults) == 1 else None
+
+
 def _config_from(args: argparse.Namespace) -> Config:
+    if (getattr(args, "command", None) in {"status", "sync", "clients"}
+            and not getattr(args, "vault", None) and not os.environ.get("BINDERY_VAULT", "").strip()):
+        agreed = _vault_from_registered_clients()
+        if agreed:
+            args.vault = agreed
     return Config.resolve(
         vault=getattr(args, "vault", None),
         state_dir=getattr(args, "state_dir", None),
