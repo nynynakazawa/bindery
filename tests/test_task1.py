@@ -22,7 +22,8 @@ def test_antigravity_gets_boundary_in_args_and_environment(tmp_path):
         exclude=["private"],
         project="alpha",
     )
-    entry = _client_targets(config)["antigravity"]
+    # An explicitly named project travels in the arguments; a detected one does not.
+    entry = _client_targets(config, pinned_project="alpha")["antigravity"]
 
     assert entry["env"] == {
         "BINDERY_VAULT": str(vault),
@@ -151,3 +152,16 @@ def test_config_update_retries_after_external_change_and_preserves_bak(tmp_path,
     assert len(backups) == 1
     assert backups[0].read_text(encoding="utf-8") == "external"
 
+
+
+def test_install_does_not_pin_the_project_detected_where_it_ran(tmp_path, monkeypatch):
+    from bindery.cli import _client_targets
+    from bindery.config import Config
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", project="whatever-cwd-said")
+    for spec in _client_targets(config, "user").values():
+        assert "--project" not in spec["args"]
+    pinned = _client_targets(config, "user", pinned_project="alpha")
+    assert pinned["claude"]["args"][pinned["claude"]["args"].index("--project") + 1] == "alpha"

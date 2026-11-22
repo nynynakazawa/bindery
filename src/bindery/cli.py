@@ -610,7 +610,7 @@ def _server_command() -> tuple[str, list[str]]:
     return sys.executable, ["-m", "bindery"]
 
 
-def _client_targets(config: Config, scope: str = "user") -> dict[str, dict]:
+def _client_targets(config: Config, scope: str = "user", pinned_project: str | None = None) -> dict[str, dict]:
     """Config payloads for every supported client, keyed by client id.
 
     Scope matters and clients express it differently. Codex keeps MCP servers
@@ -619,7 +619,13 @@ def _client_targets(config: Config, scope: str = "user") -> dict[str, dict]:
     across projects, and project scope is opt-in where the client supports it.
     """
     command, extra = _server_command()
-    args = [*extra, "--vault", str(config.vault), "--project", config.project]
+    args = [*extra, "--vault", str(config.vault)]
+    # The project is decided per session, from the directory the agent starts
+    # in. Writing the name detected where `install` happened to run would pin
+    # every future session to that one project, so it is written only when
+    # the user named it on the command line.
+    if pinned_project is not None:
+        args.extend(("--project", pinned_project))
     for prefix in config.include:
         args.extend(("--include", prefix))
     for prefix in config.exclude:
@@ -1077,7 +1083,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     """
     config = _config_from(args)
     scope = "project" if getattr(args, "local", False) else "user"
-    targets = _client_targets(config, scope)
+    targets = _client_targets(config, scope, pinned_project=getattr(args, "project", None))
     if args.client and args.client not in targets:
         print(f"Unknown client {args.client!r}. Known: {', '.join(sorted(targets))}", file=sys.stderr)
         return 2
@@ -1171,7 +1177,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("  would record existing sessions as a baseline and capture only new ones")
 
     print(f"\n[4/{steps}] MCP server configuration")
-    targets = _client_targets(config, "project" if args.local else "user")
+    targets = _client_targets(config, "project" if args.local else "user",
+                              pinned_project=getattr(args, "project", None))
     detected = _detect_clients()
     config_failed = False
     for client in sorted(targets):
