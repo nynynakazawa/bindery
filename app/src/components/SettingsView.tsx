@@ -1,178 +1,189 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import {
-  Alert,
-  Box,
-  Button,
-  Chip,
-  Divider,
-  FormControl,
-  FormControlLabel,
-  Paper,
-  Radio,
-  RadioGroup,
-  Stack,
-  Step,
-  StepLabel,
-  Stepper,
-  TextField,
-  Typography,
+  Alert, Button, CircularProgress, FormControlLabel, Radio, RadioGroup, Step, StepButton, Stepper, Switch, TextField,
 } from "@mui/material";
-import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
-import CheckRoundedIcon from "@mui/icons-material/CheckRounded";
-import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
-import type { CommandResult, UvInfo } from "../types";
+import CheckOutlined from "@mui/icons-material/CheckOutlined";
+import PlayArrowOutlined from "@mui/icons-material/PlayArrowOutlined";
+import type { BinderySnapshot, CommandResult, UvInfo } from "../types";
 import { t } from "../copy";
-import { accentTextSx, cardSx } from "../theme";
+import { clientLabels } from "../lib/presentation";
+import { Panel } from "./DashboardParts";
 
-const steps = [
-  { id: "uv", label: "setup.step.uv" as const, description: "setup.uv.description" as const },
-  { id: "wheel", label: "setup.step.wheel" as const, description: "setup.wheel.description" as const },
-  { id: "vault", label: "setup.step.vault" as const, description: "setup.vault.description" as const },
-  { id: "clients", label: "setup.step.clients" as const, description: "setup.clients.description" as const },
-  { id: "sync", label: "setup.step.sync" as const, description: "setup.sync.description" as const },
-  { id: "scheduler", label: "setup.step.scheduler" as const, description: "setup.scheduler.description" as const },
-];
-
-type StepId = (typeof steps)[number]["id"];
+const steps = ["uv", "wheel", "vault", "clients", "sync", "scheduler"] as const;
+type StepId = (typeof steps)[number];
 
 function commandFor(step: StepId, vault: string, remote: string, mode: "init" | "pair"): string {
-  const quotedVault = vault ? ` --vault "${vault}"` : "";
-  if (step === "uv") return "uv --version";
-  if (step === "wheel") return "uv tool install <bundled-wheel>";
-  if (step === "vault") return t("setup.vaultPickerCommand");
-  if (step === "clients") return `bindery install claude --write${quotedVault}\nbindery install codex --write${quotedVault}\nbindery install antigravity --write${quotedVault}\nbindery prompt --global --write`;
-  if (step === "sync") return mode === "init" ? `bindery sync init --remote "${remote || "<remote>"}"${quotedVault} --write` : `bindery sync pair "${remote || "<remote>"}"${quotedVault}`;
-  return `bindery sync install${quotedVault} --write`;
+  const quotedVault = vault ? ` --vault ${JSON.stringify(vault)}` : "";
+  switch (step) {
+    case "uv": return "uv --version";
+    case "wheel": return "uv tool install <bundled-wheel>";
+    case "vault": return t("setup.vaultPickerCommand");
+    case "clients": return [...Object.keys(clientLabels).map((client) => `bindery install ${client} --write${quotedVault}`), "bindery prompt --global --write"].join("\n");
+    case "sync": return mode === "init" ? `bindery sync init --remote ${JSON.stringify(remote || "<remote>")}${quotedVault} --write` : `bindery sync pair ${JSON.stringify(remote || "<remote>")}${quotedVault}`;
+    case "scheduler": return `bindery sync install${quotedVault} --write`;
+  }
 }
 
-export function SettingsView() {
-  const [active, setActive] = useState(0);
-  const [completed, setCompleted] = useState<StepId[]>([]);
+export function SettingsView({ snapshot, onChanged, runAction }: {
+  snapshot?: BinderySnapshot; onChanged: () => void;
+  runAction: (action: () => Promise<CommandResult>) => Promise<void>;
+}) {
+  const api = window.bindery;
+  const [activeStep, setActiveStep] = useState<StepId>();
+  const [completedHere, setCompletedHere] = useState<StepId[]>([]);
   const [busy, setBusy] = useState(false);
-  const [uv, setUv] = useState<UvInfo | null>(null);
-  const [vault, setVault] = useState("");
+  const [uv, setUv] = useState<UvInfo>();
+  const [uvChecking, setUvChecking] = useState(true);
+  const [vaultChoice, setVaultChoice] = useState("");
   const [remote, setRemote] = useState("");
   const [mode, setMode] = useState<"init" | "pair">("init");
-  const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
-  const current = steps[active];
-  const command = useMemo(() => commandFor(current.id, vault, remote, mode), [current.id, mode, remote, vault]);
+  const [result, setResult] = useState<{ ok: boolean; message: string }>();
+  const [login, setLogin] = useState<boolean>();
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginError, setLoginError] = useState<string>();
 
-  const markDone = (id: StepId) => {
-    setCompleted((previous) => (previous.includes(id) ? previous : [...previous, id]));
-    if (active < steps.length - 1) setActive(active + 1);
+  useEffect(() => {
+    let current = true;
+    api.checkUv().then((info) => { if (current) setUv(info); }, () => undefined).finally(() => { if (current) setUvChecking(false); });
+    api.getLoginItem().then((enabled) => { if (current) setLogin(enabled); }, () => { if (current) setLoginError(t("settings.loginReadFailed")); });
+    return () => { current = false; };
+  }, [api]);
+
+  const vault = vaultChoice || snapshot?.status.vault || "";
+  const registered = snapshot?.clients.clients;
+  const matchesExistingVault = !vaultChoice || vaultChoice === snapshot?.status.vault;
+  const inferred: Record<StepId, boolean> = {
+    uv: Boolean(uv?.available),
+    wheel: Boolean(snapshot?.status.version && snapshot.status.version !== "unknown"),
+    vault: Boolean(vaultChoice || snapshot?.status.vault_exists),
+    clients: matchesExistingVault && Object.keys(clientLabels).every((id) => registered?.some((client) => client.id === id && client.registered && client.vault === vault)),
+    sync: matchesExistingVault && Boolean(snapshot?.sync.configured),
+    scheduler: matchesExistingVault && snapshot?.sync.scheduler === "installed",
   };
+  const done = (id: StepId) => inferred[id] || completedHere.includes(id);
+  const firstIncomplete = steps.find((id) => !done(id));
+  const current = activeStep ?? firstIncomplete;
+  const active = current ? steps.indexOf(current) : -1;
 
-  const run = async (action: () => Promise<CommandResult>, doneId: StepId) => {
+  function select(id: StepId) {
+    setResult(undefined);
+    setActiveStep(id);
+  }
+
+  async function runCurrent() {
+    if (!current || busy) return;
     setBusy(true);
-    setResult(null);
+    setResult(undefined);
     try {
-      const response = await action();
+      let response: CommandResult;
+      switch (current) {
+        case "uv": {
+          const info = await api.checkUv();
+          setUv(info);
+          response = { ok: info.available, message: info.error || t("setup.uvMissing") };
+          break;
+        }
+        case "wheel":
+          response = await api.installWheel();
+          break;
+        case "vault": {
+          const selected = await api.selectVault();
+          if (!selected) return;
+          setVaultChoice(selected);
+          if (selected !== vault) setCompletedHere((prior) => prior.filter((id) => id === "uv" || id === "wheel"));
+          response = { ok: true, message: t("setup.success") };
+          break;
+        }
+        case "clients": {
+          response = await api.installClients();
+          if (response.ok) response = await api.writeGlobalPrompt();
+          break;
+        }
+        case "sync":
+          response = remote.trim()
+            ? await (mode === "init" ? api.initSync(remote.trim()) : api.pairSync(remote.trim()))
+            : { ok: false, message: t("setup.remoteRequired") };
+          break;
+        case "scheduler":
+          response = await api.installScheduler();
+          break;
+      }
       setResult({ ok: response.ok, message: response.ok ? t("setup.success") : response.message || t("setup.failed") });
-      if (response.ok) markDone(doneId);
+      if (response.ok) {
+        setCompletedHere((prior) => prior.includes(current) ? prior : [...prior, current]);
+        setActiveStep(steps[active + 1]);
+        if (current !== "uv" && current !== "vault") onChanged();
+      }
     } catch (error) {
       setResult({ ok: false, message: error instanceof Error ? error.message : t("setup.failed") });
     } finally {
       setBusy(false);
     }
+  }
+
+  async function updateLogin(enabled: boolean) {
+    setLoginBusy(true);
+    setLoginError(undefined);
+    try {
+      setLogin(await api.setLoginItem(enabled));
+    } catch {
+      setLoginError(t("settings.loginFailed"));
+    } finally {
+      setLoginBusy(false);
+    }
+  }
+
+  const actionLabel = {
+    uv: t("setup.checkUv"), wheel: t("setup.installWheel"), vault: t("setup.chooseVault"), clients: t("setup.installClients"),
+    sync: t(mode === "init" ? "setup.initialize" : "setup.acceptPair"), scheduler: t("setup.installScheduler"),
   };
 
-  const runCurrent = async () => {
-    if (current.id === "uv") {
-      setBusy(true);
-      setResult(null);
-      try {
-        const info = await window.bindery.checkUv();
-        setUv(info);
-        setResult({ ok: info.available, message: info.available ? `${t("setup.uvFound")}: ${info.path ?? "uv"}` : t("setup.uvMissing") });
-        if (info.available) markDone("uv");
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
-    if (current.id === "wheel") return run(() => window.bindery.installWheel(), "wheel");
-    if (current.id === "vault") {
-      setBusy(true);
-      setResult(null);
-      try {
-        const selected = await window.bindery.selectVault();
-        if (selected) {
-          setVault(selected);
-          setResult({ ok: true, message: t("setup.success") });
-          markDone("vault");
-        }
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
-    if (current.id === "clients") {
-      return run(async () => {
-        const installed = await window.bindery.installClients();
-        if (!installed.ok) return installed;
-        return window.bindery.writeGlobalPrompt();
-      }, "clients");
-    }
-    if (current.id === "sync") {
-      if (!remote.trim()) {
-        setResult({ ok: false, message: t("setup.remoteRequired") });
-        return;
-      }
-      return run(() => (mode === "init" ? window.bindery.initSync(remote.trim()) : window.bindery.pairSync(remote.trim())), "sync");
-    }
-    return run(() => window.bindery.installScheduler(), "scheduler");
-  };
-
-  return (
-    <Box sx={{ minHeight: "100vh", backgroundColor: "#000", color: "text.primary", p: { xs: 2, sm: 3 } }}>
-      <Stack direction="row" spacing={1} sx={{ mb: 2, alignItems: "center" }}>
-        <Button onClick={() => window.close()} startIcon={<ArrowBackRoundedIcon />} sx={{ color: "#A1A1A6", minWidth: 0 }}>{t("common.close")}</Button>
-        <Box sx={{ flex: 1 }} />
-        <Typography sx={{ fontWeight: 700 }}>{t("app.name")}</Typography>
-      </Stack>
-      <Box sx={{ maxWidth: 720, mx: "auto" }}>
-        <Typography variant="h1" sx={{ ...accentTextSx }}>{t("settings.title")}</Typography>
-        <Typography sx={{ color: "#A1A1A6", mt: 0.8, mb: 2.5 }}>{t("settings.subtitle")}</Typography>
-        <Stepper activeStep={active} alternativeLabel sx={{ mb: 3, "& .MuiStepConnector-line": { borderColor: "rgba(255,255,255,0.12)" }, "& .MuiStepIcon-root.Mui-active": { color: "#FFB547" }, "& .MuiStepIcon-root.Mui-completed": { color: "#30D158" } }}>
-          {steps.map((step) => <Step key={step.id} completed={completed.includes(step.id)}><StepLabel>{t(step.label)}</StepLabel></Step>)}
-        </Stepper>
-
-        <Paper elevation={0} sx={{ ...cardSx, p: { xs: 2, sm: 3 } }}>
-          <Stack direction="row" spacing={2} sx={{ justifyContent: "space-between", alignItems: "start" }}>
-            <Box>
-              <Typography variant="h2">{t(current.label)}</Typography>
-              <Typography sx={{ color: "#A1A1A6", mt: 0.8 }}>{t(current.description)}</Typography>
-            </Box>
-            {completed.includes(current.id) && <Chip icon={<CheckRoundedIcon />} label={t("setup.success")} size="small" color="success" variant="outlined" />}
-          </Stack>
-          <Divider sx={{ my: 2.3 }} />
-
-          {current.id === "uv" && uv && <Alert severity={uv.available ? "success" : "error"} sx={{ mb: 2 }}>{uv.available ? `${t("setup.uvFound")}: ${uv.path}` : uv.error || t("setup.uvMissing")}</Alert>}
-          {current.id === "vault" && vault && <Box sx={{ p: 1.4, mb: 2, borderRadius: 2, backgroundColor: "rgba(255,181,71,0.08)", border: "1px solid rgba(255,181,71,0.24)" }}><Typography variant="body2" sx={{ color: "#A1A1A6" }}>{t("setup.selectedVault")}</Typography><Typography noWrap sx={{ mt: 0.35, fontSize: 13 }}>{vault}</Typography></Box>}
-          {current.id === "sync" && (
-            <Stack spacing={2} sx={{ mb: 2 }}>
-              <FormControl>
-                <RadioGroup row value={mode} onChange={(event) => setMode(event.target.value as "init" | "pair")}>
-                  <FormControlLabel value="init" control={<Radio size="small" />} label={t("setup.initialize")} />
-                  <FormControlLabel value="pair" control={<Radio size="small" />} label={t("setup.acceptPair")} />
-                </RadioGroup>
-              </FormControl>
-              <Typography variant="body2" sx={{ color: "#A1A1A6" }}>{mode === "init" ? t("setup.initializeHint") : t("setup.pairHint")}</Typography>
-              <TextField label={t("setup.remoteLabel")} placeholder={t("setup.remotePlaceholder")} value={remote} onChange={(event) => setRemote(event.target.value)} fullWidth slotProps={{ htmlInput: { maxLength: 512 } }} />
-            </Stack>
-          )}
-
-          <Typography variant="body2" sx={{ color: "#6E6E73", mb: 0.75 }}>{t("setup.command")}</Typography>
-          <Box component="code" sx={{ display: "block", p: 1.35, mb: 2.3, borderRadius: 2, backgroundColor: "#070708", border: "1px solid rgba(255,255,255,0.08)", color: "#D8B477", fontSize: 11, overflowX: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{command}</Box>
-          {result && <Alert severity={result.ok ? "success" : "error"} sx={{ mb: 2 }}>{result.message}</Alert>}
-          <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center" }}>
-            <Button disabled={active === 0 || busy} onClick={() => setActive(active - 1)}>{t("common.back")}</Button>
-            <Button variant="contained" startIcon={<PlayArrowRoundedIcon />} onClick={() => void runCurrent()} disabled={busy || (current.id === "clients" && !vault)} sx={{ backgroundColor: "#FFB547", color: "#0B0B0D", "&:hover": { backgroundColor: "#ffc46f" } }}>
-              {busy ? t("common.loading") : current.id === "uv" ? t("setup.checkUv") : current.id === "wheel" ? t("setup.installWheel") : current.id === "vault" ? t("setup.chooseVault") : current.id === "clients" ? t("setup.installClients") : current.id === "sync" ? (mode === "init" ? t("setup.initialize") : t("setup.acceptPair")) : t("setup.installScheduler")}
-            </Button>
-          </Stack>
-        </Paper>
-      </Box>
-    </Box>
-  );
+  return <div className="section-stack">
+    <Panel title={t("setup.title")}>
+      <Stepper activeStep={active} alternativeLabel nonLinear className="setup-stepper">
+        {steps.map((id) => <Step key={id} completed={done(id)}>
+          <StepButton onClick={() => select(id)} disabled={busy} icon={
+            <span className={`setup-step-icon ${id === current ? "is-active" : ""} ${done(id) ? "is-complete" : ""}`}>
+              {id === "uv" && uvChecking || busy && id === current ? <CircularProgress size={14} /> :
+                done(id) ? <CheckOutlined /> : steps.indexOf(id) + 1}
+            </span>}>{t(`setup.step.${id}`)}</StepButton>
+        </Step>)}
+      </Stepper>
+      {!current ? <div className="settings-row">
+        <span>{t("setup.complete")}</span>
+        <Button color="inherit" onClick={() => select("uv")}>{t("setup.reopen")}</Button>
+      </div> : <div className="setup-content">
+        <h3>{t(`setup.step.${current}`)}</h3>
+        <p>{t(`setup.${current}.description`)}</p>
+        {current === "uv" && uv?.available && <p className="mono meta">{uv.version} · {uv.path}</p>}
+        {current === "vault" && vault && <p><span className="meta">{t("setup.selectedVault")}</span> <span className="mono">{vault}</span></p>}
+        {current === "sync" && <div className="setup-remote">
+          <RadioGroup row value={mode} onChange={(event) => setMode(event.target.value === "pair" ? "pair" : "init")}>
+            <FormControlLabel value="init" control={<Radio size="small" />} label={t("setup.initialize")} />
+            <FormControlLabel value="pair" control={<Radio size="small" />} label={t("setup.acceptPair")} />
+          </RadioGroup>
+          <p className="meta">{t(mode === "init" ? "setup.initializeHint" : "setup.pairHint")}</p>
+          <TextField label={t("setup.remoteLabel")} placeholder={t("setup.remotePlaceholder")} value={remote}
+            onChange={(event) => setRemote(event.target.value)} fullWidth slotProps={{ htmlInput: { maxLength: 512 } }} />
+        </div>}
+        <div className="meta">{t("setup.command")}</div>
+        <pre className="setup-command mono">{commandFor(current, vault, remote, mode)}</pre>
+        {result && <Alert severity={result.ok ? "success" : "error"}>{result.message}</Alert>}
+        <div className="setup-actions">
+          <Button color="inherit" disabled={active === 0 || busy} onClick={() => select(steps[active - 1])}>{t("common.back")}</Button>
+          <Button variant="outlined" color="inherit" startIcon={busy ? <CircularProgress size={16} /> : <PlayArrowOutlined />}
+            onClick={() => void runCurrent()} disabled={busy || (current === "clients" && !vault)}>{busy ? t("common.loading") : actionLabel[current]}</Button>
+        </div>
+      </div>}
+    </Panel>
+    <Panel title={t("settings.app")}>
+      <div className="settings-row">
+        <label htmlFor="login-at-start">{t("settings.login")}</label>
+        <Switch checked={login ?? false} disabled={login === undefined || loginBusy} onChange={(_, enabled) => void updateLogin(enabled)}
+          slotProps={{ input: { id: "login-at-start" } }} />
+      </div>
+      {loginError && <p role="alert" className="login-error">{loginError}</p>}
+      <div className="settings-row"><span>{t("settings.log")}</span><Button color="inherit" variant="outlined" onClick={() => void runAction(api.openLog)}>{t("actions.openLog")}</Button></div>
+    </Panel>
+  </div>;
 }

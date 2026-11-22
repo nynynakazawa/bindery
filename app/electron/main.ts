@@ -1,6 +1,5 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell, Tray } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell, Tray } from "electron";
 import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
-import { constants } from "node:fs";
 import path from "node:path";
 import {
   binderyCandidates,
@@ -13,76 +12,29 @@ import {
   saveBinderyPath,
   uvCandidates,
 } from "./commands";
-import { IPC_CHANNELS, assertAbsolutePath, configureRendererTrust, validateIpcRequest } from "./security";
-
-interface StatusInfo {
-  version: string;
-  vault: string;
-  vault_exists: boolean;
-  indexed: boolean;
-  notes: number | null;
-  passages: number | null;
-  embedded: number | null;
-  semantic: string;
-  state_dir: string;
-  error: string | null;
-}
-
-interface ClientsInfo {
-  clients: Array<{ id: string; label: string; detected: boolean; registered: boolean; config_path: string; vault: string | null }>;
-  connections: Array<{ client: "claude" | "codex" | "antigravity" | "unknown"; pid: number; started_at: string | null; vault: string | null }>;
-  error: string | null;
-}
-
-interface SyncInfo {
-  configured: boolean;
-  remote: string | null;
-  machine: string | null;
-  sync_id: string | null;
-  last_success: string | null;
-  last_attempt: string | null;
-  git: "ok" | "error" | "blocked" | "never";
-  index: "ok" | "error" | "skipped" | "never";
-  last_error: string | null;
-  blocked_reason: string | null;
-  conflicts: number;
-  held_secrets: number;
-  scheduler: "installed" | "absent";
-  interval_seconds: number | null;
-  peers: string[];
-  error: string | null;
-}
-
-interface Snapshot {
-  status: StatusInfo;
-  clients: ClientsInfo;
-  sync: SyncInfo;
-  refreshed_at: string;
-}
-
-interface CommandResult {
-  ok: boolean;
-  message: string;
-  output?: string;
-}
+import { IPC_CHANNELS, assertAbsolutePath, configureRendererTrust, parseExternalUrl, validateIpcRequest } from "./security";
+import type { IpcChannel } from "./channels";
+import { resolveVaultFile } from "./vaultPath";
+import type {
+  BinderySnapshot, ClientsInfo, CliResponse, CommandResult, NoteDocument, NoteResponse,
+  NotesData, RankingData, RecentEntry, SearchEntry, StatusInfo, SyncInfo,
+} from "./types";
 
 const emptyStatus = (error: string): StatusInfo => ({ version: "unknown", vault: "", vault_exists: false, indexed: false, notes: null, passages: null, embedded: null, semantic: "unknown", state_dir: "", error });
 const emptyClients = (error: string): ClientsInfo => ({ clients: [], connections: [], error });
 const emptySync = (error: string): SyncInfo => ({ configured: false, remote: null, machine: null, sync_id: null, last_success: null, last_attempt: null, git: "never", index: "never", last_error: null, blocked_reason: null, conflicts: 0, held_secrets: 0, scheduler: "absent", interval_seconds: null, peers: [], error });
 
 let tray: Tray | null = null;
-let popover: BrowserWindow | null = null;
-let settingsWindow: BrowserWindow | null = null;
+let dashboard: BrowserWindow | null = null;
 let binderyPath: string | null = null;
 let selectedVault: string | null = null;
-let lastSnapshot: Snapshot | null = null;
+let lastSnapshot: BinderySnapshot | null = null;
+let pendingBinderyPath: Promise<string | null> | null = null;
+let pendingSync: Promise<BinderySnapshot> | null = null;
+let failedSync: { attempted: string | null; succeeded: string | null; syncId: string | null } | null = null;
 
 function userDataPath(name: string): string {
   return path.join(app.getPath("userData"), name);
-}
-
-function appUrl(window: BrowserWindow): string {
-  return app.isPackaged ? `file://${path.join(app.getAppPath(), "dist", "index.html")}` : "http://localhost:5173";
 }
 
 function assetPath(name: string): string {
@@ -92,7 +44,8 @@ function assetPath(name: string): string {
 function safeNativeImage(name: string): Electron.NativeImage {
   try {
     const image = nativeImage.createFromPath(assetPath(name));
-    return image.isEmpty() ? nativeImage.createEmpty() : image;
+    image.setTemplateImage(true);
+    return image;
   } catch {
     return nativeImage.createEmpty();
   }
@@ -110,13 +63,17 @@ async function appendSafeLog(message: string): Promise<void> {
 
 async function ensureBinderyPath(): Promise<string | null> {
   if (binderyPath && await executableExists(binderyPath)) return binderyPath;
-  const saved = await readSavedBinderyPath(userDataPath("bindery-path.json"));
-  const resolved = saved ?? await findExecutable(binderyCandidates());
-  if (resolved) {
-    binderyPath = resolved;
-    await saveBinderyPath(userDataPath("bindery-path.json"), resolved);
-  }
-  return resolved;
+  pendingBinderyPath ??= (async () => {
+    const saved = await readSavedBinderyPath(userDataPath("bindery-path.json"));
+    binderyPath = saved ?? await findExecutable(binderyCandidates());
+    if (binderyPath && !saved) {
+      await saveBinderyPath(userDataPath("bindery-path.json"), binderyPath).catch(() => {
+        void appendSafeLog("Could not save Bindery executable path");
+      });
+    }
+    return binderyPath;
+  })().finally(() => { pendingBinderyPath = null; });
+  return pendingBinderyPath;
 }
 
 async function runBindery(args: string[]): Promise<{ output: Awaited<ReturnType<typeof runAbsoluteCommand>>; executable: string | null }> {
@@ -129,11 +86,11 @@ async function runBindery(args: string[]): Promise<{ output: Awaited<ReturnType<
   return { executable, output };
 }
 
-async function binderyJson<T>(args: string[], fallback: T): Promise<T> {
+async function binderyJson<T>(args: string[], fallback: T, options?: { maxBuffer?: number; timeout?: number }): Promise<T> {
   const executable = await ensureBinderyPath();
   if (!executable) return fallback;
-  const result = await runJsonCommand<T>(executable, args);
-  if (result.value) return result.value;
+  const result = await runJsonCommand<T>(executable, args, options);
+  if (result.value && typeof result.value === "object") return result.value;
   return fallback;
 }
 
@@ -146,104 +103,115 @@ async function getClients(): Promise<ClientsInfo> {
   return binderyJson<ClientsInfo>(["clients", "--json"], emptyClients("Bindery clients unavailable"));
 }
 
-async function getSync(): Promise<SyncInfo> {
-  return binderyJson<SyncInfo>(["sync", "status", "--json"], emptySync("Bindery sync status unavailable"));
+async function getSync(fallback = emptySync("Bindery sync status unavailable")): Promise<SyncInfo> {
+  return binderyJson<SyncInfo>(["sync", "status", "--json"], fallback);
 }
 
-async function getSnapshot(): Promise<Snapshot> {
-  const [status, clients, sync] = await Promise.all([getStatus(), getClients(), getSync()]);
-  const snapshot = { status, clients, sync, refreshed_at: new Date().toISOString() };
+async function getSnapshot(syncResult?: SyncInfo): Promise<BinderySnapshot> {
+  const [status, clients, sync] = await Promise.all([getStatus(), getClients(), syncResult ?? getSync()]);
+  if (failedSync && (sync.last_attempt !== failedSync.attempted ||
+      sync.last_success !== failedSync.succeeded || sync.sync_id !== failedSync.syncId)) failedSync = null;
+  const snapshot = {
+    status,
+    clients,
+    sync: failedSync ? { ...sync, error: "Sync could not be completed" } : sync,
+    syncing: !syncResult && Boolean(pendingSync),
+    refreshed_at: new Date().toISOString(),
+  };
   lastSnapshot = snapshot;
-  updateTray(snapshot);
+  updateTray();
   return snapshot;
 }
 
-function updateTray(snapshot: Snapshot | null): void {
+function syncNow(): Promise<BinderySnapshot> {
+  if (pendingSync) return pendingSync;
+  failedSync = null;
+  pendingSync = (async () => {
+    const result = await binderyJson<{ exit_code: number; status?: SyncInfo }>(["sync", "--json"], { exit_code: 1 }, { timeout: 120_000 });
+    const sync = await getSync(result.status);
+    if (!result.status || (result.exit_code !== 0 && !sync.error && !sync.last_error && !sync.blocked_reason)) {
+      failedSync = { attempted: sync.last_attempt, succeeded: sync.last_success, syncId: sync.sync_id };
+    }
+    void appendSafeLog(`bindery sync exited=${result.exit_code}`);
+    return getSnapshot(sync);
+  })().finally(() => {
+    pendingSync = null;
+    updateTray();
+  });
+  updateTray();
+  return pendingSync;
+}
+
+function updateTray(): void {
   if (!tray) return;
-  const active = Boolean(snapshot?.clients.connections.length || snapshot?.sync.git === "ok");
-  const name = active ? "trayActiveTemplate.png" : "trayTemplate.png";
-  tray.setImage(safeNativeImage(name));
+  const active = Boolean(pendingSync || lastSnapshot?.clients.connections.length);
+  tray.setImage(safeNativeImage(active ? "trayActiveTemplate.png" : "trayTemplate.png"));
 }
 
-function rendererUrl(window: BrowserWindow): string {
-  return appUrl(window);
-}
-
-function configureWindow(window: BrowserWindow): void {
+function createDashboard(): BrowserWindow {
+  const window = new BrowserWindow({
+    width: 1100,
+    height: 720,
+    minWidth: 880,
+    minHeight: 560,
+    title: "Bindery",
+    titleBarStyle: "hiddenInset",
+    trafficLightPosition: { x: 16, y: 16 },
+    show: false,
+    backgroundColor: "#000000",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
   window.webContents.on("will-navigate", (event) => event.preventDefault());
   window.webContents.on("will-redirect", (event) => event.preventDefault());
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-}
-
-async function loadWindow(window: BrowserWindow): Promise<void> {
-  if (app.isPackaged) await window.loadFile(path.join(app.getAppPath(), "dist", "index.html"));
-  else await window.loadURL(rendererUrl(window));
-}
-
-function createPopover(): BrowserWindow {
-  const window = new BrowserWindow({
-    width: 360,
-    height: 650,
-    show: false,
-    frame: false,
-    resizable: false,
-    movable: false,
-    skipTaskbar: true,
-    transparent: false,
-    backgroundColor: "#000000",
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  });
-  configureWindow(window);
-  window.on("blur", () => { if (window.isVisible()) window.hide(); });
-  void loadWindow(window);
+  window.on("closed", () => { dashboard = null; });
+  const loaded = app.isPackaged
+    ? window.loadFile(path.join(app.getAppPath(), "dist", "index.html"))
+    : window.loadURL("http://localhost:5173");
+  void loaded.catch(() => { void appendSafeLog("Dashboard renderer could not be loaded"); });
   return window;
 }
 
-function showPopover(): void {
-  if (!popover || !tray) return;
-  const trayBounds = tray.getBounds();
-  const windowBounds = popover.getBounds();
-  const x = Math.round(trayBounds.x + trayBounds.width / 2 - windowBounds.width / 2);
-  const y = Math.round(trayBounds.y + trayBounds.height + 6);
-  popover.setPosition(x, y, false);
-  popover.show();
-  popover.focus();
-  void getSnapshot();
+function showDashboard(): void {
+  if (!app.isReady()) return;
+  dashboard ??= createDashboard();
+  if (dashboard.isMinimized()) dashboard.restore();
+  if (process.platform === "darwin") app.focus({ steal: true });
+  dashboard.show();
+  dashboard.focus();
 }
 
-function createSettingsWindow(): BrowserWindow {
-  const window = new BrowserWindow({
-    width: 760,
-    height: 720,
-    minWidth: 640,
-    minHeight: 620,
-    title: "Bindery",
-    show: false,
-    backgroundColor: "#000000",
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      additionalArguments: ["--bindery-window=settings"],
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  });
-  configureWindow(window);
-  window.on("closed", () => { settingsWindow = null; });
-  void loadWindow(window);
-  return window;
+const DASHBOARD_OUTPUT_LIMIT = 16 * 1024 * 1024;
+
+function dashboardJson<T>(args: string[], error: string): Promise<CliResponse<T>> {
+  return binderyJson<CliResponse<T>>(args, { error }, { maxBuffer: DASHBOARD_OUTPUT_LIMIT });
 }
 
-function showSettings(): void {
-  if (!settingsWindow) settingsWindow = createSettingsWindow();
-  if (popover?.isVisible()) popover.hide();
-  settingsWindow.show();
-  settingsWindow.focus();
+async function resolveNoteActionPath(relative: string, status?: StatusInfo): Promise<string> {
+  // Note commands use the registered Vault, independently of a pending setup selection.
+  // Another local process can replace a path component after validation and before the OS opens it.
+  const { vault, vault_exists } = status ?? await getStatus();
+  if (!vault || !vault_exists) throw new Error("No registered Vault");
+  assertAbsolutePath(vault);
+  return resolveVaultFile(vault, relative);
+}
+
+async function readNote(relative: string): Promise<NoteResponse> {
+  const markdown = /\.md$/iu.test(relative);
+  const note = markdown
+    ? await dashboardJson<NoteDocument>(["read", "--json", "--", relative], "Could not read the note")
+    : { error: "Expected a Markdown note" };
+  if (note.error === null) return note;
+  // The review list comes from a snapshot that already identifies its Vault.
+  const status = markdown ? undefined : lastSnapshot?.status;
+  const canReveal = (markdown || status !== undefined) &&
+    await resolveNoteActionPath(relative, status).then(() => true, () => false);
+  return { ...note, canReveal };
 }
 
 function getConfiguredVault(status: StatusInfo): string {
@@ -269,29 +237,55 @@ async function installClients(): Promise<CommandResult> {
 }
 
 function setupWheelDirectory(): string {
-  return app.isPackaged ? path.join(process.resourcesPath, "wheel") : path.resolve(__dirname, "..", "dist-wheel");
+  return app.isPackaged ? path.join(process.resourcesPath, "wheel") : path.resolve(__dirname, "..", "..", "dist-wheel");
 }
 
 function registerIpc(): void {
-  const guarded = <T>(channel: string, action: (args: unknown) => Promise<T> | T): void => {
-    ipcMain.handle(channel, async (event, args: unknown) => {
-      validateIpcRequest(channel, args, event.senderFrame?.url);
-      return action(args);
+  const guarded = <Args extends [] | [string] | [boolean], T>(channel: IpcChannel, action: (...args: Args) => T): void => {
+    ipcMain.handle(channel, (event, ...args: unknown[]) => {
+      if (event.sender !== dashboard?.webContents || event.senderFrame?.parent !== null || args.length > 1) {
+        throw new Error("Invalid IPC invocation");
+      }
+      validateIpcRequest(channel, args[0], event.senderFrame.url);
+      return action(...args as Args);
     });
   };
 
-  guarded(IPC_CHANNELS.getWindowKind, () => (settingsWindow?.webContents.getURL().includes("settings") ? "settings" : process.argv.includes("--bindery-window=settings") ? "settings" : "popover"));
   guarded(IPC_CHANNELS.getSnapshot, () => getSnapshot());
-  guarded(IPC_CHANNELS.syncNow, async () => {
-    await operationResult("sync", ["sync", "--json"]);
-    return getSnapshot();
+  guarded(IPC_CHANNELS.syncNow, syncNow);
+  guarded(IPC_CHANNELS.search, (query: string) => query.trim()
+    ? dashboardJson<{ results: SearchEntry[] }>(["search", "--json", "--", query], "Search unavailable")
+    : { results: [], error: null });
+  guarded(IPC_CHANNELS.listNotes, () => dashboardJson<NotesData>(["notes", "--json"], "Note index unavailable"));
+  guarded(IPC_CHANNELS.readNote, readNote);
+  guarded(IPC_CHANNELS.recent, () => dashboardJson<{ entries: RecentEntry[] }>(["recent", "--json", "--limit", "20"], "Recent records unavailable"));
+  guarded(IPC_CHANNELS.ranking, () => dashboardJson<RankingData>(["ranking", "--json", "--limit", "10"], "Rankings unavailable"));
+  guarded(IPC_CHANNELS.openInObsidian, async (relative: string) => {
+    const target = await resolveNoteActionPath(relative);
+    if (!/\.md$/iu.test(target)) throw new Error("Expected a Markdown note");
+    await shell.openExternal(`obsidian://open?path=${encodeURIComponent(target)}`);
+  });
+  guarded(IPC_CHANNELS.revealInFinder, async (relative: string) => {
+    shell.showItemInFolder(await resolveNoteActionPath(relative));
+  });
+  guarded(IPC_CHANNELS.openExternal, (url: string) => shell.openExternal(parseExternalUrl(url).href));
+  guarded(IPC_CHANNELS.getLoginItem, () => app.getLoginItemSettings().openAtLogin);
+  guarded(IPC_CHANNELS.setLoginItem, (enabled: boolean) => {
+    app.setLoginItemSettings({ openAtLogin: enabled });
+    const settings = app.getLoginItemSettings();
+    if (settings.openAtLogin !== enabled || (enabled && settings.status === "requires-approval")) {
+      throw new Error("Login item setting was not approved");
+    }
+    return settings.openAtLogin;
   });
   guarded(IPC_CHANNELS.openVault, async () => {
     const status = await getStatus();
-    const target = getConfiguredVault(status);
+    const target = status.vault;
     try {
+      assertAbsolutePath(target);
       await stat(target);
-      return { ok: true, message: await shell.openPath(target) };
+      const message = await shell.openPath(target);
+      return { ok: !message, message };
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : "Vault could not be opened" };
     }
@@ -300,12 +294,13 @@ function registerIpc(): void {
     const target = path.join(app.getPath("logs"), "bindery-app.log");
     try {
       await mkdir(path.dirname(target), { recursive: true });
-      return { ok: true, message: await shell.openPath(target) };
+      await appendFile(target, "", { mode: 0o600 });
+      const message = await shell.openPath(target);
+      return { ok: !message, message };
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : "Log could not be opened" };
     }
   });
-  guarded(IPC_CHANNELS.showSettings, () => { showSettings(); });
   guarded(IPC_CHANNELS.checkUv, async () => {
     const uvPath = await findExecutable(uvCandidates());
     if (!uvPath) return { available: false, path: null, version: null, error: "uv was not found in the supported locations" };
@@ -324,24 +319,22 @@ function registerIpc(): void {
     return binderyPath ? { ok: true, message: "Bindery wheel installed" } : { ok: false, message: "Bindery installed but executable was not found" };
   });
   guarded(IPC_CHANNELS.selectVault, async () => {
-    const parent = settingsWindow ?? popover;
+    const parent = dashboard;
     const result = parent
       ? await dialog.showOpenDialog(parent, { properties: ["openDirectory", "createDirectory"] })
       : await dialog.showOpenDialog({ properties: ["openDirectory", "createDirectory"] });
     const chosen = result.canceled ? null : result.filePaths[0] ?? null;
     if (chosen) { assertAbsolutePath(chosen); selectedVault = path.resolve(chosen); }
-    return selectedVault;
+    return chosen;
   });
   guarded(IPC_CHANNELS.installClients, () => installClients());
   guarded(IPC_CHANNELS.writeGlobalPrompt, () => operationResult("prompt", ["prompt", "--global", "--write"]));
-  guarded(IPC_CHANNELS.initSync, async (args) => {
+  guarded(IPC_CHANNELS.initSync, async (remote: string) => {
     const vault = getConfiguredVault(await getStatus());
-    const remote = args as string;
     return operationResult("sync init", ["sync", "init", "--remote", remote, "--vault", vault, "--write"]);
   });
-  guarded(IPC_CHANNELS.pairSync, async (args) => {
+  guarded(IPC_CHANNELS.pairSync, async (remote: string) => {
     const vault = getConfiguredVault(await getStatus());
-    const remote = args as string;
     return operationResult("sync pair", ["sync", "pair", remote, "--vault", vault]);
   });
   guarded(IPC_CHANNELS.installScheduler, async () => {
@@ -350,26 +343,41 @@ function registerIpc(): void {
   });
 }
 
-function createTray(): void {
+async function createTray(): Promise<void> {
+  const language = app.getLocale().toLowerCase().startsWith("en") ? "en" : "ja";
+  const copy = JSON.parse(await readFile(path.join(app.getAppPath(), "src", "copy", `${language}.json`), "utf8")) as Record<string, string>;
   tray = new Tray(safeNativeImage("trayTemplate.png"));
   tray.setToolTip("Bindery");
-  tray.on("click", () => {
-    if (popover?.isVisible()) popover.hide();
-    else showPopover();
-  });
+  const menu = Menu.buildFromTemplate([
+    { label: copy["actions.openBindery"], click: showDashboard },
+    { label: copy["actions.syncNow"], click: () => { void syncNow().catch(() => { void appendSafeLog("Tray sync failed"); }); } },
+    { type: "separator" },
+    { label: copy["actions.quit"], role: "quit" },
+  ]);
+  tray.on("click", showDashboard);
+  tray.on("right-click", () => tray?.popUpContextMenu(menu));
+  updateTray();
 }
 
-app.whenReady().then(() => {
-  configureRendererTrust({ packaged: app.isPackaged, indexPath: path.join(app.getAppPath(), "dist", "index.html") });
-  if (process.platform === "darwin") app.dock?.hide();
-  registerIpc();
-  popover = createPopover();
-  createTray();
-  void getSnapshot();
-});
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on("second-instance", showDashboard);
+  app.on("activate", showDashboard);
+  app.on("window-all-closed", () => {
+    // The tray remains available after the dashboard is closed.
+  });
+  app.on("will-quit", () => { tray?.destroy(); tray = null; });
 
-app.on("window-all-closed", () => {
-  // Bindery is a menu bar app; closing a settings window must not quit the tray process.
-});
-app.on("before-quit", () => { tray?.destroy(); });
-
+  void app.whenReady().then(() => {
+    configureRendererTrust({ packaged: app.isPackaged, indexPath: path.join(app.getAppPath(), "dist", "index.html") });
+    registerIpc();
+    if (process.platform === "darwin") {
+      Menu.setApplicationMenu(Menu.buildFromTemplate([
+        { role: "appMenu" }, { role: "fileMenu" }, { role: "editMenu" }, { role: "windowMenu" },
+      ]));
+    }
+    showDashboard();
+    void createTray().catch(() => { void appendSafeLog("Tray could not be created"); });
+  });
+}

@@ -1,0 +1,91 @@
+{
+  "name": "bindery-app",
+  "productName": "Bindery",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop dashboard for Bindery, the shared memory for coding agents.",
+  "license": "Apache-2.0",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build && tsc -p tsconfig.electron.json && vite build --config vite.preload.config.mts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
+    "test": "vitest run",
+    "dist": "npm run build && electron-builder --mac dmg --arm64"
+  },
+  "build": {
+    "appId": "io.github.nynynakazawa.bindery",
+    "productName": "Bindery",
+    "files": [
+      "dist/index.html",
+      "dist/assets/**/*",
+      "dist-electron/**/*",
+      "!dist-electron/**/*.test.js",
+      "build-assets/tray*.png",
+      "src/copy/*.json",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist-wheel",
+        "to": "wheel",
+        "filter": [
+          "*.whl"
+        ]
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "build-assets/icon.icns"
+    },
+    "dmg": {
+      "background": "build-assets/dmg-background.png",
+      "contents": [
+        {
+          "x": 180,
+          "y": 200,
+          "type": "file"
+        },
+        {
+          "x": 480,
+          "y": 200,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "directories": {
+      "output": "release",
+      "buildResources": "build-assets"
+    }
+  },
+  "dependencies": {
+    "@emotion/react": "11.14.0",
+    "@emotion/styled": "11.14.1",
+    "@mui/icons-material": "9.5.0",
+    "@mui/material": "9.5.0",
+    "markdown-it": "15.0.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "14.2.0",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.1"
+  }
+}

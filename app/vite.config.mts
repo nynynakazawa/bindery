@@ -8,6 +8,8 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // React Fast Refresh injects an inline script, which the app CSP blocks.
+    hmr: false,
   },
   build: {
     outDir: "dist",

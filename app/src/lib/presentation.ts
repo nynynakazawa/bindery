@@ -1,10 +1,12 @@
 import type { ClientsInfo, ConnectionInfo, SyncInfo } from "../types";
 
-const defaultLabels: Record<string, string> = {
+export const clientLabels = {
   claude: "Claude Code",
   codex: "Codex",
   antigravity: "Antigravity",
-};
+} as const;
+
+const defaultLabels: Record<string, string> = clientLabels;
 
 export function formatConnectedCliNames(clients: ClientsInfo): string[] {
   const labels = new Map(clients.clients.map((client) => [client.id, client.label]));

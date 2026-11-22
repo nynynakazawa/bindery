@@ -1,23 +1,9 @@
 import path from "node:path";
 
-export const IPC_CHANNELS = {
-  getWindowKind: "app:get-window-kind",
-  getSnapshot: "app:get-snapshot",
-  syncNow: "app:sync-now",
-  openVault: "app:open-vault",
-  openLog: "app:open-log",
-  showSettings: "app:show-settings",
-  checkUv: "setup:check-uv",
-  installWheel: "setup:install-wheel",
-  selectVault: "setup:select-vault",
-  installClients: "setup:install-clients",
-  writeGlobalPrompt: "setup:write-global-prompt",
-  initSync: "setup:init-sync",
-  pairSync: "setup:pair-sync",
-  installScheduler: "setup:install-scheduler",
-} as const;
+import { IPC_CHANNELS } from "./channels";
+import { assertRelativePath } from "./vaultPath";
 
-export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];
+export { IPC_CHANNELS } from "./channels";
 
 export interface RendererTrust {
   /** Packaged builds trust exactly one file: the bundled renderer. */
@@ -38,7 +24,7 @@ export function isTrustedRendererUrl(rawUrl: string, current: RendererTrust | nu
   if (!current) return false;
   try {
     const url = new URL(rawUrl);
-    if (url.protocol === "file:") {
+    if (url.protocol === "file:" && current.packaged && !url.hostname) {
       // Compare the whole path, not a suffix: any other file named
       // dist/index.html on disk must not be able to drive the app.
       return path.resolve(decodeURIComponent(url.pathname)) === path.resolve(current.indexPath);
@@ -82,25 +68,52 @@ export function assertAbsolutePath(value: string): void {
 export function validateIpcRequest(channel: string, args: unknown, senderUrl: string | undefined): void {
   assertTrustedSender(senderUrl);
   switch (channel) {
-    case IPC_CHANNELS.getWindowKind:
     case IPC_CHANNELS.getSnapshot:
     case IPC_CHANNELS.syncNow:
     case IPC_CHANNELS.openVault:
     case IPC_CHANNELS.openLog:
-    case IPC_CHANNELS.showSettings:
     case IPC_CHANNELS.checkUv:
     case IPC_CHANNELS.installWheel:
     case IPC_CHANNELS.selectVault:
     case IPC_CHANNELS.installClients:
     case IPC_CHANNELS.writeGlobalPrompt:
     case IPC_CHANNELS.installScheduler:
+    case IPC_CHANNELS.listNotes:
+    case IPC_CHANNELS.recent:
+    case IPC_CHANNELS.ranking:
+    case IPC_CHANNELS.getLoginItem:
       assertNoArguments(args);
       return;
     case IPC_CHANNELS.initSync:
     case IPC_CHANNELS.pairSync:
       assertRemote(args);
       return;
+    case IPC_CHANNELS.search:
+      if (typeof args !== "string" || args.length > 500 || args.includes("\0")) throw new Error("Invalid search query");
+      return;
+    case IPC_CHANNELS.openInObsidian:
+      assertRelativePath(args);
+      if (!/\.md$/iu.test(args)) throw new Error("Expected a Markdown note");
+      return;
+    case IPC_CHANNELS.readNote:
+    case IPC_CHANNELS.revealInFinder:
+      assertRelativePath(args);
+      return;
+    case IPC_CHANNELS.openExternal:
+      parseExternalUrl(args);
+      return;
+    case IPC_CHANNELS.setLoginItem:
+      if (typeof args !== "boolean") throw new Error("Expected a boolean");
+      return;
     default:
       throw new Error("Unknown IPC operation");
   }
+}
+
+export function parseExternalUrl(value: unknown): URL {
+  if (typeof value !== "string" || value.length > 8192 || /[\u0000-\u001f\u007f]/u.test(value) ||
+      !/^https?:\/\//iu.test(value)) throw new Error("Invalid external URL");
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Invalid external URL");
+  return url;
 }

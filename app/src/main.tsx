@@ -1,6 +1,9 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { language } from "./copy";
+
+document.documentElement.lang = language;
 
 if (import.meta.env.DEV && !window.bindery) {
   const { installDevPreview } = await import("./devPreview");

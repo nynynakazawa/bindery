@@ -41,7 +41,7 @@ export async function findExecutable(candidates: string[]): Promise<string | nul
   return null;
 }
 
-export async function runAbsoluteCommand(executable: string, args: string[], timeout = COMMAND_TIMEOUT_MS): Promise<CommandOutput> {
+export async function runAbsoluteCommand(executable: string, args: string[], timeout = COMMAND_TIMEOUT_MS, maxBuffer = MAX_OUTPUT_BYTES): Promise<CommandOutput> {
   if (!isAbsoluteExecutable(executable)) throw new Error("Executable must be an absolute path");
   if (args.some((arg) => typeof arg !== "string" || /[\u0000]/u.test(arg))) throw new Error("Invalid command argument");
   try {
@@ -49,7 +49,7 @@ export async function runAbsoluteCommand(executable: string, args: string[], tim
       shell: false,
       windowsHide: true,
       timeout,
-      maxBuffer: MAX_OUTPUT_BYTES,
+      maxBuffer,
       encoding: "utf8",
     });
     return { stdout: result.stdout, stderr: result.stderr, code: 0 };
@@ -66,8 +66,8 @@ export function parseJson<T>(stdout: string): T {
   return JSON.parse(trimmed) as T;
 }
 
-export async function runJsonCommand<T>(executable: string, args: string[]): Promise<JsonCommandResult<T>> {
-  const output = await runAbsoluteCommand(executable, args);
+export async function runJsonCommand<T>(executable: string, args: string[], options: { maxBuffer?: number; timeout?: number } = {}): Promise<JsonCommandResult<T>> {
+  const output = await runAbsoluteCommand(executable, args, options.timeout, options.maxBuffer);
   try {
     return { value: parseJson<T>(output.stdout), output, error: null };
   } catch (error) {
