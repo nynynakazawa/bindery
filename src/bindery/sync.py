@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import signal
 import re
 import shlex
@@ -2171,7 +2172,19 @@ def scheduler_status(config) -> tuple[str, int | None]:
 
 
 def _scheduler_command(config) -> list[str]:
-    return [str(Path(sys.executable).resolve()), "-m", "bindery", "--vault", str(config.vault), "--state-dir", str(config.state_dir), "sync"]
+    # Do not resolve sys.executable: in a uv/pipx tool environment the venv's
+    # python is a symlink to a shared interpreter, and following it leaves the
+    # venv, so the job starts a Python that cannot import bindery. Prefer the
+    # console script installed beside it. Options belong after `sync`; the
+    # top-level parser does not accept --vault.
+    interpreter = Path(sys.executable).absolute()
+    beside = interpreter.parent / "bindery"
+    if beside.is_file():
+        program = [str(beside)]
+    else:
+        found = shutil.which("bindery")
+        program = [str(Path(found).absolute())] if found else [str(interpreter), "-m", "bindery"]
+    return [*program, "sync", "--vault", str(config.vault), "--state-dir", str(config.state_dir)]
 
 
 def _systemd_quote(value: str) -> str:

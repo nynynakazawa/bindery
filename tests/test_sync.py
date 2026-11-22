@@ -974,3 +974,32 @@ def test_timeout_kills_the_whole_process_group(tmp_path):
     import time
     time.sleep(3.5)
     assert not marker.exists()
+
+
+def test_scheduler_command_stays_in_the_environment_and_parses(tmp_path, monkeypatch):
+    """The job must run a bindery that can import itself and accept its args.
+
+    Resolving sys.executable used to escape the tool venv to a bare interpreter
+    ("No module named bindery"), and --vault placed before `sync` is rejected
+    by the top-level parser.
+    """
+    from bindery.cli import build_parser
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    real_python = tmp_path / "shared" / "python3.12"
+    real_python.parent.mkdir()
+    real_python.write_text("")
+    (venv_bin / "python3").symlink_to(real_python)
+    script = venv_bin / "bindery"
+    script.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(sync.sys, "executable", str(venv_bin / "python3"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    command = sync._scheduler_command(config)
+    assert command[0] == str(script)
+    assert str(real_python) not in command
+    args = build_parser().parse_args(command[1:])
+    assert args.command == "sync"
+    assert str(args.vault) == str(vault)
