@@ -286,7 +286,12 @@ def _semantic_ranking(
     # tests use, and one module holding its own reference silently opted out.
     from .embed import load_backend
 
-    backend = load_backend()
+    if store.read_only:
+        if store.conn.execute("SELECT 1 FROM vectors LIMIT 1").fetchone() is None:
+            return []
+        backend = load_backend(local_files_only=True)
+    else:
+        backend = load_backend()
     if backend is None:
         return []
     try:
@@ -428,6 +433,24 @@ def search(
         "truncated": truncated,
         "redundant": redundant,
     }
+
+
+def search_with_project_fallback(
+    config: Config,
+    store: Store,
+    query: str,
+    *,
+    limit: int | None = None,
+    max_tokens: int | None = None,
+    learn: bool = True,
+    scope: str = "project",
+) -> tuple[list[Hit], dict[str, int], bool]:
+    hits, meta = search(config, store, query, limit=limit, max_tokens=max_tokens, learn=learn, scope=scope)
+    if not hits and scope == "project" and config.project:
+        # A renamed or newly detected project can still have answers elsewhere.
+        hits, meta = search(config, store, query, limit=limit, max_tokens=max_tokens, learn=learn, scope="all")
+        return hits, meta, bool(hits)
+    return hits, meta, False
 
 
 def count_outside_scope(config: Config, store: Store, query: str) -> int:

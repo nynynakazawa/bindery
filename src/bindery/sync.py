@@ -1610,11 +1610,11 @@ def _index_after_sync(config, written: list[str]) -> str:
             store.close()
 
 
-def _status_from_state(config, state: dict | None = None) -> dict:
-    paths = paths_for(config)
-    state = state or _load_state(paths)
+def _status_from_state(config, state: dict | None = None, *, include_paths: bool = False) -> dict:
+    if state is None:
+        state = _load_state(paths_for(config))
     scheduler = scheduler_status(config)
-    return {
+    status = {
         "configured": bool(state.get("configured")),
         "remote": state.get("remote_display") or state.get("remote"),
         "remote_connection": state.get("remote"),
@@ -1636,13 +1636,48 @@ def _status_from_state(config, state: dict | None = None) -> dict:
         "peers": sorted(set(str(p) for p in state.get("peers", []) if p)),
         "error": state.get("last_error") or state.get("blocked_reason"),
     }
+    if include_paths:
+        status["held_paths"] = _held_paths(state)
+        try:
+            status["conflict_paths"] = _conflict_paths(config.vault)
+        except OSError:
+            status["conflict_paths"] = []
+            status["error"] = status["error"] or "Vault 内の衝突コピーを確認できません"
+    return status
 
 
-def sync_status(config) -> dict:
+def _held_paths(state: dict) -> list[str]:
+    held = state.get("held_secrets")
+    paths = set()
+    if isinstance(held, list):
+        for path in held:
+            if not isinstance(path, str):
+                continue
+            try:
+                paths.add(_safe_rel(path))
+            except SyncBlocked:
+                continue
+    return sorted(paths)
+
+
+def _conflict_paths(vault: Path) -> list[str]:
+    # Conflict copies remain actionable even after a later sync reports zero
+    # new conflicts. Enumerate names on disk without opening their contents.
+    vault = vault.resolve()
+    return sorted(
+        path.relative_to(vault).as_posix()
+        for path in vault.rglob("*.conflict-*")
+        if re.search(r"\.conflict-[0-9a-f]{12}(?:\.[^.]+)?$", path.name)
+        and not path.is_symlink()
+        and path.is_file()
+    )
+
+
+def sync_status(config, *, include_paths: bool = False) -> dict:
     try:
-        return _status_from_state(config)
+        return _status_from_state(config, include_paths=include_paths)
     except Exception as exc:
-        status = _status_from_state(config, {})
+        status = _status_from_state(config, {}, include_paths=include_paths)
         status["error"] = _short_error(exc)
         return status
 
@@ -1713,7 +1748,8 @@ def init_sync(config, remote_value: str, *, write: bool = False, allow_public_ho
         return SyncResult(1, status, _short_error(exc))
 
 
-def run_sync(config, *, allow_public_host: bool = False, key_store: str | None = None) -> SyncResult:
+def run_sync(config, *, allow_public_host: bool = False, key_store: str | None = None,
+             include_paths: bool = False) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
     state["last_attempt"] = _now()
@@ -1969,25 +2005,26 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                     state["last_error"] = "encryption count reached 2^32; rekey is required"
                 _save_state(paths, state)
                 paths.transaction.unlink(missing_ok=True)
-                return SyncResult(1 if index_status == "error" else 0, _status_from_state(config, state), "sync complete")
+                status = _status_from_state(config, state, include_paths=include_paths)
+                return SyncResult(1 if index_status == "error" else 0, status, "sync complete")
             raise SyncBlocked("vault changed during application; three rescans were exhausted")
         raise SyncError("sync attempts exhausted")
     except LockTimeout as exc:
         state.update({"git": "blocked", "blocked_reason": "vault or sync lock timeout", "last_error": _short_error(exc)})
         _save_state(paths, state)
-        status = _status_from_state(config, state)
+        status = _status_from_state(config, state, include_paths=include_paths)
         status["error"] = _short_error(exc)
         return SyncResult(2, status, _short_error(exc))
     except SyncBlocked as exc:
         state.update({"git": "blocked", "blocked_reason": _short_error(exc), "last_error": _short_error(exc)})
         _save_state(paths, state)
-        status = _status_from_state(config, state)
+        status = _status_from_state(config, state, include_paths=include_paths)
         status["error"] = _short_error(exc)
         return SyncResult(2, status, _short_error(exc))
     except (SyncError, OSError) as exc:
         state.update({"git": "error", "last_error": _short_error(exc)})
         _save_state(paths, state)
-        status = _status_from_state(config, state)
+        status = _status_from_state(config, state, include_paths=include_paths)
         status["error"] = _short_error(exc)
         return SyncResult(1, status, _short_error(exc))
 

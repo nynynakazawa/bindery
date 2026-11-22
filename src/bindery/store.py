@@ -141,8 +141,18 @@ def unpack_vector(blob: bytes, dim: int) -> list[float]:
 class Store:
     """Thin persistence layer over SQLite."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
         self.db_path = db_path
+        self.read_only = read_only
+        self._depth = 0
+        self._vec_dim: int | None = None
+        if read_only:
+            self.conn = sqlite3.connect(
+                f"{db_path.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None
+            )
+            self.conn.row_factory = sqlite3.Row
+            self._vec = self._load_vector_extension()
+            return
         db_path.parent.mkdir(parents=True, exist_ok=True)
         # isolation_level=None turns off the driver's implicit DEFERRED
         # transactions so that writes can be wrapped in BEGIN IMMEDIATE
@@ -167,8 +177,6 @@ class Store:
         self.conn.execute("PRAGMA busy_timeout=15000")
         self._enable_wal()
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self._depth = 0
-        self._vec_dim: int | None = None
         self._vec = self._load_vector_extension()
         self._pending_rebuild = False
         self._migrate()
@@ -576,9 +584,12 @@ class Store:
         matches are different answers, and the caller falls back to the exact
         scan only for the first.
         """
-        if not self._ensure_vec_table(len(query)):
-            return None
         try:
+            if self.read_only:
+                if not self._vec or self.get_meta("vector_dim") != str(len(query)):
+                    return None
+            elif not self._ensure_vec_table(len(query)):
+                return None
             rows = self.conn.execute(
                 "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ? "
                 "AND k = ? ORDER BY distance",

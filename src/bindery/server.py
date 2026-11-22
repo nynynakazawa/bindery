@@ -45,7 +45,7 @@ from .growth import (
 from .indexer import index_path, is_indexable, refresh_embeddings, reindex
 from .safeio import update_text
 from .sync import machine_label, sync_is_configured, sync_marker, sync_status, vault_lock
-from .search import count_outside_scope, search
+from .search import count_outside_scope, search_with_project_fallback
 from .store import Store
 from .tokens import estimate_tokens
 
@@ -136,26 +136,14 @@ class MemoryServer:
         scope = str(args.get("scope", "project")).strip().lower()
         if scope not in {"project", "global", "all"}:
             scope = "project"
-        def run(in_scope: str):
-            return search(
-                self.config,
-                self.store,
-                query,
-                limit=args.get("limit"),
-                max_tokens=args.get("max_tokens"),
-                scope=in_scope,
-            )
-
-        hits, meta = run(scope)
-        widened = False
-        if not hits and scope == "project" and self.config.project:
-            # Narrowing must never be the reason an answer is missed. When the
-            # project has nothing to say, the wider memory answers - labelled,
-            # so the agent can weigh it as another project's decision rather
-            # than as this one's. Without this the first search in a new or
-            # renamed project reports an empty memory that is in fact full.
-            hits, meta = run("all")
-            widened = bool(hits)
+        hits, meta, widened = search_with_project_fallback(
+            self.config,
+            self.store,
+            query,
+            limit=args.get("limit"),
+            max_tokens=args.get("max_tokens"),
+            scope=scope,
+        )
 
         self.session.searches += 1
         if not hits and query not in self.session.unanswered:

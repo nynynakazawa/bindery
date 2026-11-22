@@ -187,26 +187,29 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     return {}, text
 
 
-def _split_tags(raw: str) -> list[str]:
-    cleaned = raw.strip().strip("[]")
+def parse_tags(raw: str) -> list[str]:
+    cleaned = raw.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
     return [part.strip().strip("\"'") for part in cleaned.split(",") if part.strip()]
+
+
+def note_title(path: Path, meta: dict[str, str], body: str) -> str:
+    title = meta.get("title") or meta.get("name")
+    if title:
+        return title
+    for line in body.splitlines():
+        match = HEADING_RE.match(line)
+        if match:
+            return match.group(2).strip() or path.stem
+    return path.stem
 
 
 def parse_note(path: Path, text: str) -> ParsedNote:
     meta, body = parse_frontmatter(text)
-    title = meta.get("title") or meta.get("name") or ""
-    if not title:
-        for line in body.splitlines():
-            match = HEADING_RE.match(line)
-            if match:
-                title = match.group(2).strip()
-                break
-    if not title:
-        title = path.stem
-    tags = _split_tags(meta.get("tags", ""))
     links = sorted({m.group(1).strip() for m in WIKILINK_RE.finditer(text)})
     return ParsedNote(
-        title=title, tags=tags, body=body, links=links,
+        title=note_title(path, meta, body), tags=parse_tags(meta.get("tags", "")), body=body, links=links,
         project=str(meta["project"]).strip() if "project" in meta else None,
     )
 

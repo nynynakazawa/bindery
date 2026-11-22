@@ -122,9 +122,12 @@ def test_session_records_do_not_become_promotion_candidates(config):
 # ------------------------------------------------------ client neutrality --
 
 
-def test_install_covers_every_client_by_default(capsys, config):
-    from bindery.cli import build_parser, main
+def test_install_covers_every_client_by_default(capsys, config, tmp_path, monkeypatch):
+    from bindery.cli import main
 
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".codex").mkdir()
     main(["install", "--vault", str(config.vault)])
     out = capsys.readouterr().out
     assert "Claude Code" in out and "Codex" in out

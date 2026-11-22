@@ -183,7 +183,7 @@ def test_secret_is_held_without_blocking_other_files(tmp_path):
     assert sync.run_sync(cb).exit_code == 0
 
 
-def test_secret_held_conflict_copy_is_idempotent(tmp_path):
+def test_secret_held_conflict_copy_is_idempotent(tmp_path, capsys):
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
     b.mkdir()
@@ -196,7 +196,11 @@ def test_secret_held_conflict_copy_is_idempotent(tmp_path):
     assert sync.run_sync(cb).exit_code == 0
     copies = list(b.glob("note.conflict-*.md"))
     assert len(copies) == 1
-    assert sync.run_sync(cb).exit_code == 0
+    (b / "held.md").write_text("API_KEY=fixture-secret", encoding="utf-8")
+    assert main(["sync", "--json", "--vault", str(cb.vault), "--state-dir", str(cb.state_dir)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert "held.md" in result["status"]["held_paths"]
+    assert result["status"]["conflict_paths"] == [copies[0].name]
     assert len(list(b.glob("note.conflict-*.md"))) == 1
 
 

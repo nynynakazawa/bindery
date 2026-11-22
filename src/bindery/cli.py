@@ -21,7 +21,7 @@ import shlex
 from pathlib import Path
 
 from . import __version__
-from .config import Config
+from .config import Config, _clean_prefixes
 from .episodes import set_baseline
 from .indexer import index_path, reindex
 from .search import search
@@ -96,9 +96,17 @@ def _vault_from_registered_clients() -> str | None:
     return vaults.pop() if len(vaults) == 1 else None
 
 
+def _vault_is_configured(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "vault", None) or os.environ.get("BINDERY_VAULT", "").strip())
+
+
 def _config_from(args: argparse.Namespace) -> Config:
-    if (getattr(args, "command", None) in {"status", "sync", "clients"}
-            and not getattr(args, "vault", None) and not os.environ.get("BINDERY_VAULT", "").strip()):
+    command = getattr(args, "command", None)
+    uses_registered_vault = (
+        command in {"status", "sync", "clients", "notes", "read", "recent", "ranking"}
+        or (command == "search" and getattr(args, "json", False))
+    )
+    if uses_registered_vault and not _vault_is_configured(args):
         agreed = _vault_from_registered_clients()
         if agreed:
             args.vault = agreed
@@ -159,37 +167,43 @@ def _embed_missing(config: Config, store: Store) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
+    if args.json:
+        return cmd_dashboard(args)
     config = _config_from(args)
     store = Store(config.db_path)
     reindex(config, store)
     hits, meta = search(config, store, args.query, limit=args.limit, max_tokens=args.max_tokens)
-    if args.json:
-        print(json.dumps(
-            {
-                "meta": meta,
-                "hits": [
-                    {
-                        "path": h.chunk.path,
-                        "heading": h.chunk.breadcrumb,
-                        "tokens": h.chunk.tokens,
-                        "matched_by": h.matched_by,
-                        "body": h.chunk.body,
-                    }
-                    for h in hits
-                ],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ))
-    else:
-        print(f"{meta['returned']} passage(s), ~{meta['tokens']} tokens "
-              f"({meta['truncated']} dropped by budget)\n")
-        for hit in hits:
-            where = hit.chunk.path + (f" # {hit.chunk.breadcrumb}" if hit.chunk.breadcrumb else "")
-            print(f"--- {where}  [{hit.matched_by}]")
-            print(hit.chunk.body)
-            print()
+    print(f"{meta['returned']} passage(s), ~{meta['tokens']} tokens "
+          f"({meta['truncated']} dropped by budget)\n")
+    for hit in hits:
+        where = hit.chunk.path + (f" # {hit.chunk.breadcrumb}" if hit.chunk.breadcrumb else "")
+        print(f"--- {where}  [{hit.matched_by}]")
+        print(hit.chunk.body)
+        print()
     store.close()
+    return 0
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    from . import dashboard
+
+    try:
+        config = _config_from(args)
+        if not _vault_is_configured(args):
+            raise dashboard.DashboardError("未索引")
+        result = dashboard.payload(
+            config,
+            args.command,
+            value=getattr(args, "query", getattr(args, "path", "")),
+            limit=getattr(args, "limit", None),
+            max_tokens=getattr(args, "max_tokens", None),
+        )
+        error = None
+    except dashboard.DashboardError as exc:
+        result, error = dashboard.EMPTY_PAYLOADS[args.command], str(exc)
+    except (OSError, sqlite3.DatabaseError, ValueError, RuntimeError, OverflowError):
+        result, error = dashboard.EMPTY_PAYLOADS[args.command], "Vault または索引を読み取れません"
+    print(json.dumps({**result, "error": error}))
     return 0
 
 
@@ -231,9 +245,7 @@ def _read_status_db(config: Config) -> dict | None:
 
 def cmd_status(args: argparse.Namespace) -> int:
     config = _config_from(args)
-    explicitly_configured = bool(
-        getattr(args, "vault", None) or os.environ.get("BINDERY_VAULT", "").strip()
-    )
+    explicitly_configured = _vault_is_configured(args)
     db_info = _read_status_db(config) if explicitly_configured else None
     stats = (db_info or {"stats": {"notes": 0, "chunks": 0, "links": 0, "vectors": 0}})["stats"]
     backend = None
@@ -428,9 +440,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
     config = _config_from(args)
     action = getattr(args, "sync_action", "run")
     if action == "status":
-        payload = sync.sync_status(config)
-        if getattr(args, "json", False):
-            print(json.dumps(payload, ensure_ascii=False))
+        json_output = getattr(args, "json", False)
+        payload = sync.sync_status(config, include_paths=json_output)
+        if json_output:
+            print(json.dumps(payload))
             return 0
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
@@ -491,6 +504,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         config,
         allow_public_host=getattr(args, "allow_public_host", False),
         key_store=getattr(args, "key_store", None),
+        include_paths=getattr(args, "json", False),
     )
     return _sync_result_output(result, json_output=getattr(args, "json", False))
 
@@ -646,20 +660,6 @@ def _client_targets(config: Config, scope: str = "user", pinned_project: str | N
     # the user named it on the command line.
     if pinned_project is not None:
         args.extend(("--project", pinned_project))
-    for prefix in config.include:
-        args.extend(("--include", prefix))
-    for prefix in config.exclude:
-        args.extend(("--exclude", prefix))
-    args.append("serve")
-    env = {"BINDERY_VAULT": str(config.vault)}
-    # The boundary has to travel with the configuration. `install --include`
-    # would otherwise apply only to the index built right then: the server the
-    # agent launches would start with no boundary, rescan the whole vault at
-    # startup, and quietly index everything the user had excluded.
-    if config.include:
-        env["BINDERY_INCLUDE"] = ",".join(config.include)
-    if config.exclude:
-        env["BINDERY_EXCLUDE"] = ",".join(config.exclude)
     claude_path = (
         Path.cwd() / ".mcp.json" if scope == "project" else Path.home() / ".claude.json"
     )
@@ -668,7 +668,10 @@ def _client_targets(config: Config, scope: str = "user", pinned_project: str | N
         if scope == "project"
         else Path.home() / ".gemini" / "config" / "mcp_config.json"
     )
-    base = {"command": command, "args": args, "env": env, "lock_dir": config.state_dir}
+    base = _with_index_boundaries({
+        "command": command, "launch_args": args, "vault": str(config.vault),
+        "lock_dir": config.state_dir,
+    }, {"include": config.include, "exclude": config.exclude})
     targets: dict[str, dict] = {
         "claude": {
             "label": "Claude Code (app, CLI, and VS Code extension)",
@@ -726,6 +729,48 @@ def _client_targets(config: Config, scope: str = "user", pinned_project: str | N
             **base,
         }
     return targets
+
+
+def _with_index_boundaries(spec: dict, boundaries: dict[str, list[str]]) -> dict:
+    args = list(spec["launch_args"])
+    env = {"BINDERY_VAULT": spec["vault"]}
+    # Some clients only apply one of the two forms when starting the server.
+    for name, prefixes in boundaries.items():
+        for prefix in prefixes:
+            args.extend((f"--{name}", prefix))
+        if prefixes:
+            env[f"BINDERY_{name.upper()}"] = ",".join(prefixes)
+    return {**spec, "args": [*args, "serve"], "env": env, "boundaries": boundaries}
+
+
+def _inherit_index_boundaries(spec: dict, entry: object, inherit: set[str]) -> dict:
+    if not inherit or not isinstance(entry, dict):
+        return spec
+    before_serve: dict[str, list[str]] = {}
+    options: dict[str, list[str]] = {}
+    args = entry.get("args")
+    if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+        remaining = iter(args)
+        for arg in remaining:
+            flag, equals, value = arg.partition("=")
+            if flag == "serve":
+                before_serve, options = options, {}
+            elif flag in {"--include", "--exclude", "--vault", "--project", "--state-dir", "-m"}:
+                value = value if equals else next(remaining, None)
+                if flag in {"--include", "--exclude"} and value is not None:
+                    options.setdefault(flag[2:], []).append(value)
+    # The CLI prefers args over env, and options after `serve` override the
+    # same options before it. Carry forward the effective settings.
+    options = before_serve | options
+    env = entry.get("env")
+    boundaries = dict(spec["boundaries"])
+    for name in inherit:
+        value = env.get(f"BINDERY_{name.upper()}") if isinstance(env, dict) else None
+        if name in options:
+            boundaries[name] = _clean_prefixes(options[name])
+        elif isinstance(value, str):
+            boundaries[name] = _clean_prefixes(value.split(","))
+    return _with_index_boundaries(spec, boundaries)
 
 
 def _vscode_mcp_path() -> Path:
@@ -806,7 +851,7 @@ def _render_codex(spec: dict) -> str:
     return "\n".join(lines)
 
 
-def _write_json(spec: dict) -> str:
+def _write_json(spec: dict, inherit: set[str]) -> tuple[str, dict]:
     """Merge into a JSON config, preserving everything else.
 
     ``~/.claude.json`` is not a config file the user wrote - it is live
@@ -817,9 +862,10 @@ def _write_json(spec: dict) -> str:
     """
     path: Path = spec["path"]
     replaced = False
+    applied = spec
 
     def transform(raw: str) -> str:
-        nonlocal replaced
+        nonlocal replaced, applied
         existing: dict = {}
         if raw.strip():
             try:
@@ -834,7 +880,8 @@ def _write_json(spec: dict) -> str:
                 f"{path} has a non-object {spec['format']!r} - left untouched."
             )
         replaced = "bindery" in servers
-        servers["bindery"] = _entry_for(spec)
+        applied = _inherit_index_boundaries(spec, servers.get("bindery"), inherit)
+        servers["bindery"] = _entry_for(applied)
         return json.dumps(existing, ensure_ascii=False, indent=2) + "\n"
 
     atomic_config_update(
@@ -843,16 +890,16 @@ def _write_json(spec: dict) -> str:
         lock_dir=spec["lock_dir"],
     )
     verb = "updated" if replaced else "wrote"
-    return f"{verb} {path} ({spec['scope']} scope)"
+    return f"{verb} {path} ({spec['scope']} scope)", applied
 
 
 def _write_claude(spec: dict) -> str:
-    return _write_json(spec)
+    return _write_json(spec, set())[0]
 
 
-def _write_target(spec: dict) -> str:
+def _write_target(spec: dict, inherit: set[str]) -> tuple[str, dict]:
     """Apply one client's configuration, in whatever format it uses."""
-    return _write_codex(spec) if spec["format"] == "toml" else _write_json(spec)
+    return _write_codex(spec, inherit) if spec["format"] == "toml" else _write_json(spec, inherit)
 
 
 def _render_target(spec: dict) -> str:
@@ -893,7 +940,7 @@ def _drop_codex_block(current: str) -> tuple[str, bool]:
     return "".join(kept), found
 
 
-def _write_codex(spec: dict) -> str:
+def _write_codex(spec: dict, inherit: set[str]) -> tuple[str, dict]:
     """Write the server block, replacing an earlier one rather than duplicating it.
 
     Leaving an existing block untouched was the safer-looking choice and the
@@ -904,16 +951,25 @@ def _write_codex(spec: dict) -> str:
     """
     path: Path = spec["path"]
     replaced = False
+    applied = spec
 
     def transform(current: str) -> str:
-        nonlocal replaced
+        nonlocal replaced, applied
         remainder, replaced = _drop_codex_block(current)
+        if inherit and replaced:
+            try:
+                servers = tomllib.loads(current).get("mcp_servers", {})
+            except ValueError as exc:
+                raise ConfigWriteError(f"{path} is not valid TOML - left untouched.") from exc
+            applied = _inherit_index_boundaries(spec, servers.get("bindery"), inherit)
+        else:
+            applied = spec
         remainder = remainder.rstrip("\n")
         separator = "\n\n" if remainder else ""
-        return remainder + separator + _render_codex(spec) + "\n"
+        return remainder + separator + _render_codex(applied) + "\n"
 
     atomic_config_update(path, transform, lock_dir=spec["lock_dir"])
-    return f"updated {path}" if replaced else f"wrote {path}"
+    return (f"updated {path}" if replaced else f"wrote {path}"), applied
 
 
 #: Where each agent reads standing instructions from.
@@ -1110,6 +1166,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     chosen = [args.client] if args.client else sorted(targets)
     detected = _detect_clients()
     failed = False
+    inherit = {name for name in ("include", "exclude") if getattr(args, name, None) is None}
 
     for index, client in enumerate(chosen):
         spec = targets[client]
@@ -1123,17 +1180,16 @@ def cmd_install(args: argparse.Namespace) -> int:
             continue
         print(f"# {spec['label']} - {spec['scope']} scope - {spec['path']}")
         print()
-        print(_render_target(spec))
         if args.write:
-            print()
             try:
-                message = _write_target(spec)
-                print(message)
-                if isinstance(message, str) and message.startswith("!"):
-                    failed = True
+                message, applied = _write_target(spec, inherit)
+                print(_render_target(applied))
+                print(f"\n{message}")
             except (ConfigWriteError, ConcurrentUpdate, OSError, UnicodeError) as exc:
                 print(f"! failed to update {spec['path']}: {exc}", file=sys.stderr)
                 failed = True
+        else:
+            print(_render_target(spec))
 
     print()
     print("# Point every client at the SAME BINDERY_VAULT - that is what shares the memory.")
@@ -1211,7 +1267,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             continue
         if args.write:
             try:
-                message = _write_target(spec)
+                message, _ = _write_target(spec, set())
                 print(f"  {spec['label']}: {message}")
                 if isinstance(message, str) and message.startswith("!"):
                     config_failed = True
@@ -1363,6 +1419,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--max-tokens", type=int)
     p_search.add_argument("--json", action="store_true")
     p_search.set_defaults(func=cmd_search)
+
+    for name, help_text in (
+        ("notes", "List indexed notes and index totals."),
+        ("read", "Read a Markdown note in the vault."),
+        ("recent", "List recent journal entries."),
+        ("ranking", "Rank notes and queries by usage."),
+    ):
+        dashboard_parser = sub.add_parser(name, help=help_text)
+        _add_common(dashboard_parser, suppress_defaults=True)
+        _add_project(dashboard_parser, suppress_defaults=True)
+        dashboard_parser.add_argument("--json", action="store_true", help="Emit the Bindery.app JSON contract.")
+        if name == "read":
+            dashboard_parser.add_argument("path")
+        if name in {"recent", "ranking"}:
+            dashboard_parser.add_argument("--limit", type=int)
+        dashboard_parser.set_defaults(func=cmd_dashboard)
 
     p_status = sub.add_parser("status", help="Show index health. Exits non-zero on problems.")
     _add_common(p_status, suppress_defaults=True)
