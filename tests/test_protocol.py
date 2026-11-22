@@ -15,6 +15,7 @@ import json
 import pytest
 from mcp import Client, Implementation
 
+from bindery import sync
 from bindery.config import Config
 from bindery.server import build_server
 
@@ -105,6 +106,20 @@ def test_responses_do_not_carry_a_duplicate_payload(config):
     result = _run(go())
     assert _text(result)
     assert not getattr(result, "structured_content", None)
+
+
+def test_memory_status_reports_secret_count(config):
+    (config.vault / "secret.md").write_text("# Local note", encoding="utf-8")
+    sync._save_state(sync.paths_for(config), {"secret_paths": ["secret.md"]})
+
+    async def go():
+        mcp, _ = build_server(config)
+        async with Client(mcp) as client:
+            return await client.call_tool("memory_status", {})
+
+    status = json.loads(_text(_run(go())))["sync"]
+    assert status["secret_count"] == 1
+    assert "secret_paths" not in status
 
 
 def test_unknown_tool_is_an_error(config):

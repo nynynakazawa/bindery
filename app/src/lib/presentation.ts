@@ -23,6 +23,14 @@ export function formatSyncState(sync: SyncInfo): "ok" | "error" | "blocked" | "n
   return "never";
 }
 
+export function syncAttentionCount(sync?: SyncInfo): number {
+  if (!sync) return 0;
+  const state = formatSyncState(sync);
+  return Math.max(sync.held_secrets, sync.held_paths?.length ?? 0)
+    + Math.max(sync.conflicts, sync.conflict_paths?.length ?? 0)
+    + Number(state === "blocked" || state === "error");
+}
+
 export function formatClientState(
   client: { detected: boolean; registered: boolean },
   connections: ConnectionInfo[],

@@ -86,8 +86,9 @@ state dir のファイルを使います。`sync pair --remote-key-store` は相
 
 1. Vault を走査し、シンボリックリンク、境界外、`.obsidian/workspace*.json`、`.obsidian/cache`、
    `.DS_Store`、`.trash`、`*.tmp`、索引の exclude 対象を除外する。
-2. `.md` のローカル変更を UTF-8 として読み、`redact.contains_secret` で検査する。秘密を含む
-   ファイルは保留し、暗号化対象から外す。短い値や未知の形式は検出できない。
+2. `.md` を UTF-8 として読み、`redact.contains_secret` で検査する。秘密情報らしき内容を
+   検出したノートも既定で同期する。リモートには暗号文を保存し、ペアリングした端末の Vault には
+   平文で届く。短い値や未知の形式は検出できない。
 3. Git remote を fetch し、manifest の認証、世代、ハッシュ連鎖、object の SHA-256 とサイズを検証する。
    remote manifest に現在の境界外パスが残っていれば、追跡解除を自動化せず `blocked` にする。
 4. 前回の base、local、remote をパス単位で比較する。初回は片側だけの追加を削除と扱わない。
@@ -121,9 +122,16 @@ Vault への通常の書き込みも同じ Vault ロックを、Vault ロック�
 | `index: error` | Git は完了したが索引更新に失敗した | 1 |
 | `index: skipped` | embedding backend がないなど、Git 後に省略した | 0 |
 
-秘密を含むローカルファイルは `held_secrets` に数えます。これは他の変更を同期できるため、
-それだけでは終了コード2にしません。リモートから復号した内容に秘密らしき文字列があっても、
-警告として記録して適用します。
+`sync status --json` と `sync --json` の状態には、検出した現存ノートの Vault 相対パスを
+`secret_paths`、件数を `secret_count` として記録します。リモート側での検出は
+`remote_secret_paths` に記録し、通常どおり適用します。
+
+`bindery sync --hold-secrets` または `BINDERY_SYNC_HOLD_SECRETS=1` を指定すると、秘密情報らしき
+内容を含む未同期のローカル変更を保留します。保留のパスと件数は `held_paths` と
+`held_secrets` に記録し、ほかの変更は同期します。保留した変更は、次に既定の設定で同期すると
+送信対象に戻ります。定期実行でも保留するには、`sync install` で同じオプションか環境変数を指定します。
+既定の同期が秘密情報らしき内容を暗号化したまま中断すると、保留を有効にした実行は停止します。
+中断した同期を既定の設定で再開できます。
 
 ## 復旧表
 

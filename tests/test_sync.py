@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import base64
+import io
+import json
+import plistlib
+import shlex
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -74,11 +77,12 @@ def test_two_vaults_sync_and_remote_contains_ciphertext_only(tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
     b.mkdir()
-    (a / "private-note.md").write_text("only on A", encoding="utf-8")
+    secret = b"API_KEY=fixture-secret"
+    (a / "private-note.md").write_bytes(secret)
     remote = _bare(tmp_path)
     ca, cb = _pair(a, b, remote, tmp_path)
 
-    assert (b / "private-note.md").exists()
+    assert (b / "private-note.md").read_bytes() == secret
     assert sync.run_sync(cb).exit_code == 0
     object_ids = subprocess.run(
         ["git", "--git-dir", str(remote), "cat-file", "--batch-all-objects", "--batch-check"],
@@ -90,7 +94,7 @@ def test_two_vaults_sync_and_remote_contains_ciphertext_only(tmp_path):
         capture_output=True,
         check=True,
     ).stdout
-    assert b"only on A" not in objects
+    assert secret not in objects
     assert b"private-note.md" not in objects
     assert (sync.paths_for(ca).repo / ".git").is_dir()
     assert not (a / ".git").exists()
@@ -168,19 +172,67 @@ def test_conflict_copy_update_preserves_existing_version_in_same_plan(tmp_path):
     )
 
 
-def test_secret_is_held_without_blocking_other_files(tmp_path):
+def test_secret_syncs_and_warns_by_default(tmp_path, capsys):
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
     b.mkdir()
-    (a / "secret.md").write_text("API_KEY=supersecretvalue", encoding="utf-8")
-    (a / "safe.md").write_text("safe", encoding="utf-8")
     remote = _bare(tmp_path)
     ca, cb = _pair(a, b, remote, tmp_path)
-    result = sync.sync_status(ca)
-    assert result["held_secrets"] == 1
+    secret = "API_KEY=supersecretvalue"
+    (a / "secret.md").write_text(secret, encoding="utf-8")
+
+    args = ["--json", "--vault", str(ca.vault), "--state-dir", str(ca.state_dir)]
+    assert main(["sync", *args]) == 0
+    status = json.loads(capsys.readouterr().out)["status"]
+    assert status["held_secrets"] == 0 and status["held_paths"] == []
+    assert status["secret_count"] == 1 and status["secret_paths"] == ["secret.md"]
+    assert main(["sync", "status", *args]) == 0
+    assert json.loads(capsys.readouterr().out) == status
+
+    received = sync.run_sync(cb, include_paths=True)
+    assert received.exit_code == 0
+    assert received.status["remote_secret_paths"] == received.status["secret_paths"] == ["secret.md"]
+    assert (b / "secret.md").read_text(encoding="utf-8") == secret
+
+    # A remote warning must not restore the old contents after an edit.
+    (b / "secret.md").write_text("credential removed", encoding="utf-8")
+    assert sync.run_sync(cb, include_paths=True).status["secret_paths"] == []
+    assert sync.run_sync(ca).exit_code == 0
+    assert (a / "secret.md").read_text(encoding="utf-8") == "credential removed"
+
+
+@pytest.mark.parametrize("opt_in", ["flag", "environment"])
+def test_secret_is_held_without_blocking_other_files_and_released_by_default(tmp_path, capsys, monkeypatch, opt_in):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    remote = _bare(tmp_path)
+    ca, cb = _pair(a, b, remote, tmp_path)
+    (a / "secret.md").write_text("API_KEY=supersecretvalue", encoding="utf-8")
+    (a / "safe.md").write_text("safe", encoding="utf-8")
+    args = ["sync", "--json", "--vault", str(ca.vault), "--state-dir", str(ca.state_dir)]
+    if opt_in == "environment":
+        monkeypatch.setenv("BINDERY_SYNC_HOLD_SECRETS", "1")
+    assert main([*args, "--hold-secrets"] if opt_in == "flag" else args) == 0
+    status = json.loads(capsys.readouterr().out)["status"]
+    assert status["held_secrets"] == status["secret_count"] == 1
+    assert status["held_paths"] == status["secret_paths"] == ["secret.md"]
+    assert sync.run_sync(cb).exit_code == 0
     assert (b / "safe.md").exists()
     assert not (b / "secret.md").exists()
+
+    # States from the old version have hold information but no warning list.
+    paths = sync.paths_for(ca)
+    previous = sync._load_state(paths)
+    previous.pop("secret_paths")
+    sync._save_state(paths, previous)
+    monkeypatch.delenv("BINDERY_SYNC_HOLD_SECRETS", raising=False)
+    assert main(args) == 0
+    status = json.loads(capsys.readouterr().out)["status"]
+    assert status["held_secrets"] == 0 and status["held_paths"] == []
+    assert status["secret_paths"] == ["secret.md"]
     assert sync.run_sync(cb).exit_code == 0
+    assert (b / "secret.md").read_bytes() == (a / "secret.md").read_bytes()
 
 
 def test_secret_held_conflict_copy_is_idempotent(tmp_path, capsys):
@@ -193,15 +245,71 @@ def test_secret_held_conflict_copy_is_idempotent(tmp_path, capsys):
     (a / "note.md").write_text("remote-change", encoding="utf-8")
     assert sync.run_sync(ca).exit_code == 0
     (b / "note.md").write_text("API_KEY=local-secret", encoding="utf-8")
-    assert sync.run_sync(cb).exit_code == 0
+    assert sync.run_sync(cb, hold_secrets=True).exit_code == 0
     copies = list(b.glob("note.conflict-*.md"))
     assert len(copies) == 1
     (b / "held.md").write_text("API_KEY=fixture-secret", encoding="utf-8")
-    assert main(["sync", "--json", "--vault", str(cb.vault), "--state-dir", str(cb.state_dir)]) == 0
+    assert main(["sync", "--hold-secrets", "--json", "--vault", str(cb.vault), "--state-dir", str(cb.state_dir)]) == 0
     result = json.loads(capsys.readouterr().out)
     assert "held.md" in result["status"]["held_paths"]
     assert result["status"]["conflict_paths"] == [copies[0].name]
     assert len(list(b.glob("note.conflict-*.md"))) == 1
+
+
+@pytest.mark.parametrize("flag_first", [True, False])
+def test_init_hold_secrets_filters_preview_and_carries_into_first_sync(tmp_path, capsys, flag_first):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "secret.md").write_text("API_KEY=fixture-secret", encoding="utf-8")
+    (vault / "safe.md").write_text("safe", encoding="utf-8")
+    remote = _bare(tmp_path)
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    args = ["--no-semantic", "--vault", str(vault), "--state-dir", str(config.state_dir)]
+    init = ["sync", "--hold-secrets", "init"] if flag_first else ["sync", "init", "--hold-secrets"]
+
+    assert main([*init, "--remote", str(remote), *args]) == 0
+    preview = capsys.readouterr().out
+    assert "safe.md" in preview
+    assert "secret.md" not in preview
+    assert not sync.paths_for(config).state.exists()
+
+    assert main([*init, "--remote", str(remote), "--write", *args]) == 0
+    result = sync.run_sync(config, include_paths=True)
+    assert result.exit_code == 0
+    assert result.status["held_paths"] == ["secret.md"]
+    assert sync.run_sync(config, include_paths=True).status["held_paths"] == []
+
+
+@pytest.mark.parametrize("action", [("status",), ("uninstall",), ("key", "export")])
+def test_sync_rejects_hold_flag_for_actions_without_a_sync(action, capsys):
+    assert main(["sync", "--hold-secrets", *action]) == 2
+    assert "--hold-secrets does not apply" in capsys.readouterr().err
+
+
+def test_legacy_secret_status_includes_held_and_remote_paths_before_sync(tmp_path, capsys):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    for name in ("held.md", "received.md"):
+        (vault / name).write_text("API_KEY=fixture-secret", encoding="utf-8")
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    paths = sync.paths_for(config)
+    state = {"held_secrets": ["held.md"], "remote_secret_paths": ["held.md", "missing.md", "received.md"]}
+    sync._save_state(paths, state)
+    args = ["sync", "status", "--json", "--no-semantic", "--vault", str(vault), "--state-dir", str(config.state_dir)]
+
+    assert main(args) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["held_secrets"] == 1
+    assert status["held_paths"] == ["held.md"]
+    assert status["secret_count"] == 2
+    assert status["secret_paths"] == ["held.md", "received.md"]
+    assert "secret_paths" not in sync._read_json(paths.state)
+
+    sync._save_state(paths, {**state, "secret_paths": []})
+    assert main(args) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["secret_count"] == 0
+    assert status["secret_paths"] == []
 
 
 def test_json_contract_is_one_object_and_sync_status_is_non_secret(tmp_path, capsys):
@@ -228,6 +336,39 @@ def test_scheduler_dry_run_uses_absolute_paths_and_escapes_percent(tmp_path, cap
     output = capsys.readouterr().out
     assert str(vault.resolve()) in output
     assert "ExecStart=" in output
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+@pytest.mark.parametrize("opt_in", ["none", "flag", "environment"])
+def test_scheduler_records_hold_setting(tmp_path, monkeypatch, platform, opt_in):
+    monkeypatch.setattr(sync.sys, "platform", platform)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        if command[0] in {"launchctl", "systemctl"}:
+            return subprocess.CompletedProcess(command, 0)
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+    if opt_in == "environment":
+        monkeypatch.setenv("BINDERY_SYNC_HOLD_SECRETS", "1")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    args = ["sync", "install", "--write", "--json", "--vault", str(vault), "--state-dir", str(config.state_dir)]
+    if opt_in == "flag":
+        args.append("--hold-secrets")
+    assert main(args) == 0
+
+    monkeypatch.delenv("BINDERY_SYNC_HOLD_SECRETS", raising=False)
+    _, _, job, _ = sync._scheduler_paths(config)
+    if platform == "darwin":
+        command = plistlib.loads(job.read_bytes())["ProgramArguments"]
+    else:
+        line = next(line for line in job.read_text(encoding="utf-8").splitlines() if line.startswith("ExecStart="))
+        command = line.removeprefix("ExecStart=").split()
+    assert ("--hold-secrets" in command) == (opt_in != "none")
 
 
 def test_scheduler_write_and_uninstall_are_user_scoped(tmp_path, monkeypatch):
@@ -359,6 +500,102 @@ def test_failed_push_reuses_the_pending_commit_on_the_next_run(tmp_path, monkeyp
     recovered = json.loads(paths.state.read_text(encoding="utf-8"))
     assert recovered["accepted_manifest"] == pending["manifest_hash"]
     assert not recovered.get("pending_commit")
+
+
+@pytest.mark.parametrize("recovery", ["retry", "restart", "restart-edited", "restart-during-apply"])
+def test_remote_secret_conflict_copy_keeps_provenance_when_replanned(tmp_path, monkeypatch, recovery):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (a / "note.md").write_bytes(b"base")
+    remote = _bare(tmp_path)
+    ca, cb = _pair(a, b, remote, tmp_path)
+    paths_b = sync.paths_for(cb)
+    remote_secret = b"API_KEY=remote-secret"
+    remote_sha = sync._sha256(remote_secret)
+    local_edit = b"local version"
+    assert sync._sha256(local_edit) > remote_sha
+    copy = sync._conflict_path("note.md", remote_sha)
+    (a / "note.md").write_bytes(remote_secret)
+    assert sync.run_sync(ca).exit_code == 0
+    (b / "note.md").write_bytes(local_edit)
+    original_push = sync._push
+    original_write = sync.atomic_write
+    raced = False
+
+    def advance_peer():
+        nonlocal raced
+        raced = True
+        (a / "peer.md").write_bytes(b"advance remote head")
+        assert sync.run_sync(ca).exit_code == 0
+
+    def push_after_peer_update(paths, commit, **kwargs):
+        if paths == paths_b and not raced:
+            assert sync._read_json(paths_b.state)["pending_remote_writes"][copy] == remote_sha
+            advance_peer()
+            if recovery != "retry":
+                raise KeyboardInterrupt
+        return original_push(paths, commit, **kwargs)
+
+    def stop_after_copy_write(path, data, **kwargs):
+        original_write(path, data, **kwargs)
+        if Path(path) == b / copy:
+            raise KeyboardInterrupt
+
+    with monkeypatch.context() as failure:
+        if recovery == "restart-during-apply":
+            failure.setattr(sync, "atomic_write", stop_after_copy_write)
+        else:
+            failure.setattr(sync, "_push", push_after_peer_update)
+        if recovery == "retry":
+            result = sync.run_sync(cb, hold_secrets=True, include_paths=True)
+        else:
+            with pytest.raises(KeyboardInterrupt):
+                sync.run_sync(cb, hold_secrets=True)
+
+    if recovery != "retry":
+        if recovery == "restart-during-apply":
+            assert copy not in sync._read_json(paths_b.transaction)["completed"]
+            advance_peer()
+        assert (b / copy).read_bytes() == remote_secret
+        if recovery == "restart-edited":
+            (b / copy).write_bytes(b"API_KEY=edited-locally")
+        result = sync.run_sync(cb, hold_secrets=True, include_paths=True)
+
+    assert raced and result.exit_code == 0
+    assert (b / "peer.md").exists()
+    assert result.status["held_paths"] == ([copy] if recovery == "restart-edited" else [])
+    assert copy in result.status["secret_paths"]
+    assert "pending_remote_writes" not in sync._read_json(paths_b.state)
+    assert sync.run_sync(ca).exit_code == 0
+    if recovery == "restart-edited":
+        assert not (a / copy).exists()
+        assert (b / copy).read_bytes() == b"API_KEY=edited-locally"
+    else:
+        assert (a / copy).read_bytes() == remote_secret
+
+
+def test_hold_mode_does_not_resume_an_unpublished_secret_commit(tmp_path, monkeypatch):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    remote = _bare(tmp_path)
+    ca, cb = _pair(a, b, remote, tmp_path)
+    (a / "secret.md").write_text("API_KEY=fixture-secret", encoding="utf-8")
+
+    def failed_push(*args, **kwargs):
+        raise sync.SyncError("network")
+
+    with monkeypatch.context() as failed_network:
+        failed_network.setattr(sync, "_push", failed_push)
+        assert sync.run_sync(ca).exit_code == 1
+    assert sync.run_sync(ca, hold_secrets=True).exit_code == 2
+    assert sync.run_sync(cb).exit_code == 0
+    assert not (b / "secret.md").exists()
+
+    assert sync.run_sync(ca).exit_code == 0
+    assert sync.run_sync(cb).exit_code == 0
+    assert (b / "secret.md").read_bytes() == (a / "secret.md").read_bytes()
 
 
 def test_three_terminals_converge_after_conflicting_updates(tmp_path):
@@ -641,6 +878,53 @@ def test_json_sync_failure_reports_error_on_stderr_and_in_json(tmp_path, monkeyp
     assert "master.key" not in captured.out
 
 
+@pytest.mark.parametrize("option", ["parent", "subcommand", "environment"])
+def test_pair_carries_hold_secrets_to_peers_first_sync(tmp_path, monkeypatch, option):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    remote = _bare(tmp_path)
+    ca = Config.resolve(vault=a, state_dir=tmp_path / "state-a", semantic=False)
+    cb = Config.resolve(vault=b, state_dir=tmp_path / "state-b", semantic=False)
+    assert sync.init_sync(ca, str(remote), write=True).exit_code == 0
+    assert sync.run_sync(ca).exit_code == 0
+    (b / "secret.md").write_bytes(b"API_KEY=fixture-secret")
+
+    real_run = sync.subprocess.run
+
+    def pair_over_mock_ssh(command, **kwargs):
+        if command[0] != "ssh":
+            return real_run(command, **kwargs)
+        executable, bindery, *args = shlex.split(command[-1])
+        assert (executable, bindery) == ("exec", "/fixture/bindery")
+        with monkeypatch.context() as peer:
+            peer.delenv("BINDERY_SYNC_HOLD_SECRETS", raising=False)
+            peer.setattr(sync.sys, "stdin", io.TextIOWrapper(io.BytesIO(kwargs["input"]), encoding="utf-8"))
+            code = main([*args, "--no-semantic", "--state-dir", str(cb.state_dir)])
+        return subprocess.CompletedProcess(command, code, b"", b"")
+
+    args = ["sync"]
+    if option == "parent":
+        args.append("--hold-secrets")
+    args += ["pair", "peer", "--remote-vault", str(b), "--remote-bindery", "/fixture/bindery"]
+    args += ["--no-semantic", "--vault", str(a), "--state-dir", str(ca.state_dir)]
+    if option == "subcommand":
+        args.append("--hold-secrets")
+    with monkeypatch.context() as pairing:
+        pairing.setattr(sync.subprocess, "run", pair_over_mock_ssh)
+        if option == "environment":
+            pairing.setenv("BINDERY_SYNC_HOLD_SECRETS", "1")
+        assert main(args) == 0
+
+    first = sync.run_sync(cb, include_paths=True)
+    assert first.exit_code == 0
+    assert first.status["held_paths"] == ["secret.md"]
+    assert sync.run_sync(ca).exit_code == 0
+    assert not (a / "secret.md").exists()
+    second = sync.run_sync(cb, include_paths=True)
+    assert second.exit_code == 0 and second.status["held_paths"] == []
+
+
 def test_accept_key_persists_remote_and_checkpoint_without_init(tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
@@ -758,10 +1042,19 @@ def test_remote_secret_is_warned_and_applied_without_name_error(tmp_path):
     )
     commit = sync._git_commit(paths_a, local_head=remote_head, remote_head=remote_head)
     sync._push(paths_a, commit)
-    result = sync.run_sync(cb)
+    result = sync.run_sync(cb, hold_secrets=True)
     assert result.exit_code == 0
     assert (b / "remote-secret.md").read_bytes() == secret
     assert "remote-secret.md" in result.status["remote_secret_paths"]
+    assert result.status["held_secrets"] == 0
+
+    (b / "remote-secret.md").write_bytes(b"API_KEY=local-secret")
+    result = sync.run_sync(cb, hold_secrets=True, include_paths=True)
+    assert result.exit_code == 0
+    assert result.status["held_paths"] == ["remote-secret.md"]
+    assert (b / "remote-secret.md").read_bytes() == b"API_KEY=local-secret"
+    assert sync.run_sync(ca).exit_code == 0
+    assert (a / "remote-secret.md").read_bytes() == secret
 
 
 def test_rekey_failure_keeps_old_key_and_success_archives_it(tmp_path, monkeypatch):
@@ -815,6 +1108,34 @@ def test_rekey_preflights_normal_sync_before_replacing_root(tmp_path):
         paths, key, state["sync_id"], sync._remote_head(paths)
     )
     assert "only-b.md" in document["files"]
+
+
+@pytest.mark.parametrize("flag_first", [True, False])
+def test_rekey_holds_local_secrets_and_keeps_the_last_shared_version(tmp_path, flag_first):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "shared.md").write_bytes(b"shared version")
+    remote = _bare(tmp_path)
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    assert sync.init_sync(config, str(remote), write=True).exit_code == 0
+    assert sync.run_sync(config).exit_code == 0
+    local_secret = b"API_KEY=fixture-secret"
+    (vault / "shared.md").write_bytes(local_secret)
+    (vault / "new.md").write_bytes(local_secret)
+
+    args = ["sync", "--hold-secrets", "rekey"] if flag_first else ["sync", "rekey", "--hold-secrets"]
+    assert main([*args, "--write", "--no-semantic", "--vault", str(vault), "--state-dir", str(config.state_dir)]) == 0
+
+    paths = sync.paths_for(config)
+    state = sync._read_json(paths.state)
+    key = sync.load_key(config, state, paths)
+    sync._fetch(paths)
+    commit = sync._remote_head(paths)
+    document, _manifest_hash, _generation = sync._read_remote_manifest(paths, key, state["sync_id"], commit)
+    assert state["held_secrets"] == ["new.md", "shared.md"]
+    assert "new.md" not in document["files"]
+    assert sync._content_for_entry(paths, key, state["sync_id"], document["files"]["shared.md"], commit=commit) == b"shared version"
+    assert (vault / "shared.md").read_bytes() == local_secret
 
 
 def test_rekey_aborts_when_remote_head_changes_before_force_push(tmp_path, monkeypatch):

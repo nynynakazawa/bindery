@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ClientsInfo, SyncInfo } from "../types";
-import { formatClientState, formatConnectedCliNames, formatSyncState } from "./presentation";
+import { formatClientState, formatConnectedCliNames, formatSyncState, syncAttentionCount } from "./presentation";
 
 const clients: ClientsInfo = {
   clients: [
@@ -45,6 +45,12 @@ describe("renderer presentation helpers", () => {
     expect(formatSyncState(sync({ git: "ok" }))).toBe("ok");
     expect(formatSyncState(sync({ git: "error" }))).toBe("error");
     expect(formatSyncState(sync({ git: "ok", blocked_reason: "tampered" }))).toBe("blocked");
+  });
+
+  it("counts reviewable sync issues and excludes synced secret warnings", () => {
+    const warnings = { git: "ok" as const, secret_count: 2, secret_paths: ["a.md", "b.md"] };
+    expect(syncAttentionCount(sync(warnings))).toBe(0);
+    expect(syncAttentionCount(sync({ ...warnings, conflict_paths: ["copy.md"], held_secrets: 1, git: "blocked" }))).toBe(3);
   });
 
   it("prioritizes connection, registration, detection, then missing", () => {

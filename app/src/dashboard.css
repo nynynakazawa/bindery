@@ -131,6 +131,8 @@ button:focus-visible, summary:focus-visible, .MuiButtonBase-root.Mui-focusVisibl
 .attention-row:last-child { border-bottom: 0; }
 .attention-row .MuiButton-root { min-height: 28px; }
 .attention-row > .attention-file { flex: 1; min-width: 0; justify-content: flex-start; border-radius: 8px; text-align: left; padding: 4px; }
+.sync-secret-notes .sync-secret-note { display: flex; width: 100%; min-height: 32px; justify-content: flex-start; border-radius: 8px; text-align: left; padding: 4px 8px; }
+.sync-secret-note.MuiButtonBase-root:hover { background: rgb(255 255 255 / 4%); }
 .warning-outline { color: var(--warning); border-color: rgb(255 214 10 / 34%); flex-shrink: 0; }
 .error-outline { color: var(--error); border-color: rgb(255 69 58 / 34%); flex-shrink: 0; }
 .nothing-to-check { display: flex; gap: 8px; align-items: center; padding-block: 12px; color: var(--secondary); }

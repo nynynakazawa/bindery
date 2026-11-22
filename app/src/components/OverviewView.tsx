@@ -5,7 +5,7 @@ import { t } from "../copy";
 import type { BinderySnapshot, RankingData, RecentEntry } from "../types";
 import type { ListState } from "../lib/dashboardData";
 import type { NoteLocation } from "../lib/noteLinks";
-import { clientLabels } from "../lib/presentation";
+import { clientLabels, formatSyncState, syncAttentionCount } from "../lib/presentation";
 import { Empty, LoadingRows, NoteRow, Panel, Problem, SyncIndicator, number, relativeTime, unavailable } from "./DashboardParts";
 
 export function OverviewView({ snapshot, rankings, recent, syncing, go, open, refresh, error }: {
@@ -33,7 +33,10 @@ export function OverviewView({ snapshot, rankings, recent, syncing, go, open, re
 
   const status = snapshot?.status;
   const sync = snapshot?.sync;
-  const attention = (sync?.held_secrets ?? 0) + (sync?.conflicts ?? 0) + Number(Boolean(sync?.blocked_reason));
+  const attention = syncAttentionCount(sync);
+  const syncState = sync && formatSyncState(sync);
+  const stopped = syncState === "blocked" || syncState === "error";
+  const conflicts = Math.max(sync?.conflicts ?? 0, sync?.conflict_paths?.length ?? 0);
   const all = (section: string) => <Button color="inherit" size="small" endIcon={<ChevronRightOutlined />} onClick={() => go("memory", section)}>{t("common.all")}</Button>;
 
   return <div className="section-stack">
@@ -60,18 +63,18 @@ export function OverviewView({ snapshot, rankings, recent, syncing, go, open, re
           </ButtonBase>}
       </Panel>
       <Panel title={t("overview.syncStatus")} className="summary-panel">
-        {!sync ? <LoadingRows /> : sync.error ? <Problem title={t("sync.loadError")} retry={refresh} /> :
+        {!sync ? <LoadingRows /> : sync.error && !sync.configured ? <Problem title={t("sync.loadError")} retry={refresh} /> :
           <ButtonBase className="summary-action" onClick={() => go("sync", attention ? "sync-attention" : undefined)}>
             <SyncIndicator sync={sync} running={syncing} />
             <span className="overview-sync-info">
               <span>{t("sync.lastSuccess")} <b>{relativeTime(sync.last_success) || unavailable}</b></span>
               <span className="ellipsis" title={sync.peers.join(", ")}>{t("sync.peers")} <b>{sync.peers.join(", ") || unavailable}</b></span>
             </span>
-            <span className={`attention-count ${attention ? "has-attention" : ""} ${sync.blocked_reason ? "is-blocked" : ""}`}>
+            <span className={`attention-count ${attention ? "has-attention" : ""} ${stopped ? "is-blocked" : ""}`}>
               {t("sync.noticeCount", { count: attention })}
               {Boolean(sync.held_secrets) && <span>{t("sync.heldSecrets")} {number(sync.held_secrets)}</span>}
-              {Boolean(sync.conflicts) && <span>{t("sync.conflicts")} {number(sync.conflicts)}</span>}
-              {sync.blocked_reason && <span>{t("sync.blockedReason")}</span>}
+              {Boolean(conflicts) && <span>{t("sync.conflicts")} {number(conflicts)}</span>}
+              {stopped && <span>{t("sync.stopped")}</span>}
             </span>
           </ButtonBase>}
       </Panel>

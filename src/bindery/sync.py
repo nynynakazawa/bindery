@@ -25,6 +25,7 @@ import sys
 import time
 import unicodedata
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -693,14 +694,18 @@ def _safe_rel(rel: str) -> str:
     return rel
 
 
-def _scan_vault(config, *, held: list[str] | None = None) -> tuple[dict[str, dict], list[str], list[str]]:
-    """Return manifest, secret-held paths, and unreadable Markdown paths."""
+def _hold_secrets(requested: bool = False) -> bool:
+    return requested or os.environ.get("BINDERY_SYNC_HOLD_SECRETS") == "1"
+
+
+def _scan_vault(config) -> tuple[dict[str, dict], list[str], list[str]]:
+    """Return manifest, detected secret paths, and unreadable Markdown paths."""
     manifest: dict[str, dict] = {}
-    held_paths: list[str] = []
+    secret_paths: list[str] = []
     unreadable: list[str] = []
     vault = config.vault.resolve()
     if not vault.exists():
-        return manifest, held_paths, unreadable
+        return manifest, secret_paths, unreadable
     for path in sorted(vault.rglob("*")):
         if path.is_dir() or path.is_symlink():
             continue
@@ -723,12 +728,9 @@ def _scan_vault(config, *, held: list[str] | None = None) -> tuple[dict[str, dic
                 unreadable.append(rel)
                 continue
             if contains_secret(text):
-                held_paths.append(rel)
-                continue
+                secret_paths.append(rel)
         manifest[rel] = {"sha256": _sha256(data), "size": len(data), "machine": machine_label(config)}
-    if held is not None:
-        held[:] = sorted(held_paths)
-    return manifest, held_paths, unreadable
+    return manifest, secret_paths, unreadable
 
 
 def _machines_path(config) -> Path:
@@ -758,11 +760,6 @@ def _manifest_document(files: dict[str, dict], generation: int, previous_hash: s
 
 def _manifest_hash(document: dict) -> str:
     return _sha256(_json_bytes(document))
-
-
-def _manifest_entry(manifest: dict, rel: str) -> dict | None:
-    value = manifest.get("files", {}).get(rel)
-    return value if isinstance(value, dict) else None
 
 
 def _manifest_files(manifest: dict) -> dict[str, dict]:
@@ -870,6 +867,17 @@ def _changed(entry: dict | None, base: dict | None) -> bool:
     return entry.get("sha256") != base.get("sha256")
 
 
+def _local_secrets(files: dict, secret_paths: list[str], *shared_versions: dict,
+                   remote_writes: dict[str, str] | None = None) -> set[str]:
+    """Find detected files whose exact path and contents have not synced."""
+    remote_writes = remote_writes or {}
+    return {
+        rel for rel in secret_paths
+        if files[rel]["sha256"] != remote_writes.get(rel)
+        and all(_changed(files[rel], versions.get(rel)) for versions in shared_versions)
+    }
+
+
 @dataclass(slots=True)
 class PlanItem:
     path: str
@@ -948,7 +956,7 @@ def _reserve_plan_version(config, plan: SyncPlan, path: str, data: bytes, templa
     plan.base_after[path] = dict(entry)
 
 
-def _plan_claimed_conflict_copy(config, plan: SyncPlan, path: str, claim_data: bytes, claim_entry: dict,
+def _plan_claimed_conflict_copy(config, plan: SyncPlan, path: str, claim_data: bytes, claim_entry: dict, claim_source: str,
                                 local: dict | None, remote: dict | None,
                                 local_data: bytes | None, remote_data: bytes | None) -> None:
     """Keep a primary conflict's loser at its deterministic copy path.
@@ -957,8 +965,7 @@ def _plan_claimed_conflict_copy(config, plan: SyncPlan, path: str, claim_data: b
     that would otherwise be updated at that path is therefore preserved as a
     second deterministic conflict copy instead of being overwritten.
     """
-    _reserve_plan_version(config, plan, path, claim_data, claim_entry,
-                          source="remote" if remote and remote.get("sha256") == _sha256(claim_data) else "local")
+    _reserve_plan_version(config, plan, path, claim_data, claim_entry, source=claim_source)
     seen_hashes = {_sha256(claim_data)}
     for entry, data, source in (
         (local, local_data, "local"),
@@ -982,7 +989,7 @@ def _plan(config, paths: SyncPaths, master: bytes, sync_id: str, base_doc: dict,
     all_paths = sorted(set(base_files) | set(local_files) | set(remote_files))
     local_content: dict[str, bytes | None] = {}
     remote_content: dict[str, bytes | None] = {}
-    conflict_claims: dict[str, tuple[bytes, dict]] = {}
+    conflict_claims: dict[str, tuple[bytes, dict, str]] = {}
     for rel in all_paths:
         if rel in local_files:
             local_content[rel] = (config.vault / rel).read_bytes()
@@ -1007,7 +1014,7 @@ def _plan(config, paths: SyncPaths, master: bytes, sync_id: str, base_doc: dict,
         if rel in held:
             if remote and _changed(remote, base) and remote.get("sha256") != (local or {}).get("sha256") and rel.lower().endswith(".md"):
                 conflict = _conflict_path(rel, str(remote["sha256"]))
-                conflict_claims[conflict] = (remote_content[rel], dict(remote))
+                conflict_claims[conflict] = (remote_content[rel], dict(remote), "remote")
             continue
         if rel == ".bindery-sync/machines.json" or not (local and remote and _changed(local, base) and _changed(remote, base)):
             continue
@@ -1019,7 +1026,7 @@ def _plan(config, paths: SyncPaths, master: bytes, sync_id: str, base_doc: dict,
         existing_claim = conflict_claims.get(conflict)
         if existing_claim is not None and _sha256(existing_claim[0]) != _sha256(loser_data):
             raise SyncBlocked(f"conflicting versions claim the same conflict path: {conflict}")
-        conflict_claims[conflict] = (loser_data, dict(loser))
+        conflict_claims[conflict] = (loser_data, dict(loser), "remote" if loser is remote else "local")
 
     for rel in all_paths:
         if rel != ".bindery-sync/machines.json" and _boundary_excluded(rel, config):
@@ -1050,8 +1057,7 @@ def _plan(config, paths: SyncPaths, master: bytes, sync_id: str, base_doc: dict,
                 config,
                 plan,
                 rel,
-                claim[0],
-                claim[1],
+                *claim,
                 local,
                 remote,
                 local_content.get(rel),
@@ -1120,7 +1126,7 @@ def _plan(config, paths: SyncPaths, master: bytes, sync_id: str, base_doc: dict,
             loser_data = local_content[rel] if loser is local else remote_content[rel]
             conflict = _conflict_path(rel, str(loser["sha256"]))
             target = config.vault / conflict
-            conflict_claims[conflict] = (loser_data, dict(loser))
+            conflict_claims[conflict] = (loser_data, dict(loser), "remote" if loser is remote else "local")
             # Write a new conflict copy immediately.  An existing copy is
             # handled when its own manifest path reaches the second pass below
             # so its three-way update can be preserved as another copy.
@@ -1322,6 +1328,26 @@ def _planned_data(paths: SyncPaths, master: bytes, sync_id: str, item: PlanItem)
     return decrypt_object(master, sync_id, item.object_id, object_path.read_bytes())
 
 
+def _remember_remote_writes(paths: SyncPaths, state: dict, transaction: dict, files: dict,
+                            *, written: list[str] | None = None) -> None:
+    # The vault write can finish before the transaction records completion.
+    # Match the exact bytes from the plan before discarding its provenance.
+    completed = set(transaction.get("completed", []))
+    if written is not None:
+        completed.update(written)
+    known = state.get("pending_remote_writes") or {}
+    writes = {
+        item["path"]: item["write_sha256"]
+        for item in transaction.get("items", [])
+        if item.get("source") == "remote" and not item.get("delete")
+        and (item["path"] in completed or files.get(item["path"], {}).get("sha256") == item["write_sha256"])
+        and known.get(item["path"]) != item["write_sha256"]
+    }
+    if writes:
+        state["pending_remote_writes"] = {**known, **writes}
+        _save_state(paths, state)
+
+
 def _apply_plan(config, paths: SyncPaths, plan: SyncPlan, master: bytes, sync_id: str) -> list[str]:
     transaction_info = _load_transaction(paths)
     if transaction_info is None:
@@ -1331,36 +1357,32 @@ def _apply_plan(config, paths: SyncPaths, plan: SyncPlan, master: bytes, sync_id
     _validate_plan_paths(config, plan, set(plan.publish) | {item.path for item in plan.items})
     completed = {str(path) for path in transaction.get("completed", []) if isinstance(path, str)}
     written: list[str] = []
-    try:
-        with vault_lock(config, timeout=10):
-            for item in plan.items:
-                target = config.vault / item.path
-                if item.path in completed:
-                    expected_after = None if item.delete else str(transaction_item(transaction, item.path).get("write_sha256"))
-                    if _current_sha(target) != expected_after:
-                        raise PlanChanged(f"vault changed after planned write: {item.path}")
-                    written.append(item.path)
-                    continue
-                if _current_sha(target) != item.expected_sha:
-                    raise PlanChanged(f"vault changed while applying plan: {item.path}")
-                if item.delete:
-                    if target.exists():
-                        target.unlink()
-                else:
-                    data = _planned_data(paths, master, sync_id, item)
-                    if _sha256(data) != str(transaction_item(transaction, item.path).get("write_sha256")):
-                        raise SyncBlocked(f"sync transaction object hash does not match: {item.path}")
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    if target.is_symlink():
-                        raise PlanChanged(f"refusing to replace symlink: {item.path}")
-                    atomic_write(target, data)
+    with vault_lock(config, timeout=10):
+        for item in plan.items:
+            target = config.vault / item.path
+            if item.path in completed:
+                expected_after = None if item.delete else str(transaction_item(transaction, item.path).get("write_sha256"))
+                if _current_sha(target) != expected_after:
+                    raise PlanChanged(f"vault changed after planned write: {item.path}")
                 written.append(item.path)
-                completed.add(item.path)
-                transaction["completed"] = [i.path for i in plan.items if i.path in completed]
-                _write_json(paths.transaction, transaction)
-    except PlanChanged:
-        paths.transaction.unlink(missing_ok=True)
-        raise
+                continue
+            if _current_sha(target) != item.expected_sha:
+                raise PlanChanged(f"vault changed while applying plan: {item.path}")
+            if item.delete:
+                if target.exists():
+                    target.unlink()
+            else:
+                data = _planned_data(paths, master, sync_id, item)
+                if _sha256(data) != str(transaction_item(transaction, item.path).get("write_sha256")):
+                    raise SyncBlocked(f"sync transaction object hash does not match: {item.path}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink():
+                    raise PlanChanged(f"refusing to replace symlink: {item.path}")
+                atomic_write(target, data)
+            written.append(item.path)
+            completed.add(item.path)
+            transaction["completed"] = [i.path for i in plan.items if i.path in completed]
+            _write_json(paths.transaction, transaction)
     return written
 
 
@@ -1372,7 +1394,8 @@ def transaction_item(transaction: dict, path: str) -> dict:
 
 
 def _write_encrypted_tree(paths: SyncPaths, config, master: bytes, sync_id: str, files: dict[str, dict], generation: int,
-                          previous_hash: str | None, *, reuse_commit: str | None = None) -> tuple[str, str, int, str, dict[str, dict]]:
+                          previous_hash: str | None, *, reuse_commit: str | None = None,
+                          read_previous: Callable[[str], bytes | None] | None = None) -> tuple[str, str, int, str, dict[str, dict]]:
     objects = paths.repo / "objects"
     objects.mkdir(parents=True, exist_ok=True)
     _enc_key, name_key, _kid = derive_keys(master)
@@ -1404,6 +1427,8 @@ def _write_encrypted_tree(paths: SyncPaths, config, master: bytes, sync_id: str,
                     data = candidate
             except SyncBlocked:
                 data = None
+        if data is None and read_previous is not None:
+            data = read_previous(rel)
         if data is None:
             raise SyncBlocked(f"file changed or encrypted object missing before encryption: {rel}")
         if not object_path.exists():
@@ -1619,6 +1644,10 @@ def _status_from_state(config, state: dict | None = None, *, include_paths: bool
     if state is None:
         state = _load_state(paths_for(config))
     scheduler = scheduler_status(config)
+    reported_secrets = state.get("secret_paths")
+    if "secret_paths" not in state:
+        reported_secrets = _safe_state_paths(state.get("held_secrets")) + _safe_state_paths(state.get("remote_secret_paths"))
+    secret_paths = _existing_secret_paths(config.vault, reported_secrets)
     status = {
         "configured": bool(state.get("configured")),
         "remote": state.get("remote_display") or state.get("remote"),
@@ -1634,6 +1663,7 @@ def _status_from_state(config, state: dict | None = None, *, include_paths: bool
         "blocked_reason": state.get("blocked_reason"),
         "conflicts": int(state.get("conflicts", 0)),
         "held_secrets": len(state.get("held_secrets", [])) if isinstance(state.get("held_secrets"), list) else int(state.get("held_secrets", 0) or 0),
+        "secret_count": len(secret_paths),
         "remote_secret_paths": sorted(str(p) for p in state.get("remote_secret_paths", []) if p),
         "encryption_counts": {str(k): int(v or 0) for k, v in (state.get("encryption_counts") or {}).items()} if isinstance(state.get("encryption_counts"), dict) else {},
         "scheduler": scheduler[0],
@@ -1642,7 +1672,8 @@ def _status_from_state(config, state: dict | None = None, *, include_paths: bool
         "error": state.get("last_error") or state.get("blocked_reason"),
     }
     if include_paths:
-        status["held_paths"] = _held_paths(state)
+        status["held_paths"] = _safe_state_paths(state.get("held_secrets"))
+        status["secret_paths"] = secret_paths
         try:
             status["conflict_paths"] = _conflict_paths(config.vault)
         except OSError:
@@ -1651,11 +1682,10 @@ def _status_from_state(config, state: dict | None = None, *, include_paths: bool
     return status
 
 
-def _held_paths(state: dict) -> list[str]:
-    held = state.get("held_secrets")
+def _safe_state_paths(value: object) -> list[str]:
     paths = set()
-    if isinstance(held, list):
-        for path in held:
+    if isinstance(value, list):
+        for path in value:
             if not isinstance(path, str):
                 continue
             try:
@@ -1663,6 +1693,19 @@ def _held_paths(state: dict) -> list[str]:
             except SyncBlocked:
                 continue
     return sorted(paths)
+
+
+def _existing_secret_paths(vault: Path, value: object) -> list[str]:
+    vault = vault.resolve()
+    paths = []
+    for rel in _safe_state_paths(value):
+        path = vault / rel
+        try:
+            if path.resolve() == path and path.is_file():
+                paths.append(rel)
+        except (OSError, RuntimeError):
+            continue
+    return paths
 
 
 def _conflict_paths(vault: Path) -> list[str]:
@@ -1688,8 +1731,9 @@ def sync_status(config, *, include_paths: bool = False) -> dict:
 
 
 def init_sync(config, remote_value: str, *, write: bool = False, allow_public_host: bool = False,
-              key_store: str | None = None) -> SyncResult:
+              key_store: str | None = None, hold_secrets: bool = False) -> SyncResult:
     try:
+        hold_secrets = _hold_secrets(hold_secrets)
         requested_key_store = _key_store_choice(key_store)
         if (config.vault / ".git").exists():
             raise SyncBlocked("Vault must not contain a .git directory for encrypted sync")
@@ -1720,6 +1764,8 @@ def init_sync(config, remote_value: str, *, write: bool = False, allow_public_ho
                 "blocked_reason": None,
                 "last_error": None,
             }
+            if hold_secrets:
+                state["hold_secrets_on_first_sync"] = True
             key = None
             try:
                 key = load_key(config, state, paths, key_store=key_store)
@@ -1732,10 +1778,10 @@ def init_sync(config, remote_value: str, *, write: bool = False, allow_public_ho
             return SyncResult(0, _status_from_state(config, state), "sync initialized")
         # Dry run performs all non-mutating validation and reports the first
         # files that would be sent without creating the key or repository.
-        files, held, unreadable = _scan_vault(config)
+        files, secret_paths, unreadable = _scan_vault(config)
         if unreadable:
             raise SyncBlocked("unreadable Markdown would be excluded: " + ", ".join(unreadable))
-        names = sorted(files)
+        names = sorted(files.keys() - set(secret_paths) if hold_secrets else files.keys())
         status = _status_from_state(config, current)
         status["error"] = None
         return SyncResult(0, status, "would initialize encrypted sync; files: " + (", ".join(names) if names else "(none)"))
@@ -1754,10 +1800,12 @@ def init_sync(config, remote_value: str, *, write: bool = False, allow_public_ho
 
 
 def run_sync(config, *, allow_public_host: bool = False, key_store: str | None = None,
-             include_paths: bool = False) -> SyncResult:
+             include_paths: bool = False, hold_secrets: bool = False) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
-    state["last_attempt"] = _now()
+    attempted_at = _now()
+    state["last_attempt"] = attempted_at
+    requested_hold = _hold_secrets(hold_secrets)
     try:
         _key_store_choice(key_store)
         if (config.vault / ".git").exists():
@@ -1775,8 +1823,12 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
         with vault_lock(config):
             _register_machine(config, label, write=True)
         with sync_lock(config):
+            # Another run can finish while this process waits for the lock.
+            state = _load_state(paths)
+            state["last_attempt"] = attempted_at
+            hold_secrets = requested_hold or bool(state.get("hold_secrets_on_first_sync"))
             for _attempt in range(MAX_SYNC_ATTEMPTS):
-                local_files, held, unreadable = _scan_vault(config)
+                local_files, secret_paths, unreadable = _scan_vault(config)
                 if unreadable:
                     raise SyncBlocked("cannot inspect Markdown before encryption: " + ", ".join(unreadable))
                 _fetch(paths)
@@ -1802,6 +1854,9 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                 # Confirming the pending commit here advances the checkpoint
                 # without manufacturing a second commit.
                 pending = state.get("pending_commit")
+                pending_head = pending.get("commit") if isinstance(pending, dict) else None
+                if hold_secrets and state.get("pending_local_secrets") and (not pending_head or pending_head != remote_head):
+                    raise SyncBlocked("a pending sync includes local secrets; resume without --hold-secrets or BINDERY_SYNC_HOLD_SECRETS=1")
                 if isinstance(pending, dict) and pending.get("commit") and pending.get("commit") != remote_head:
                     if _git_head(paths) == pending.get("commit"):
                         try:
@@ -1838,22 +1893,17 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                             "base_commit": remote_head,
                         })
                     state.pop("pending_commit", None)
+                    state.pop("pending_local_secrets", None)
+                    state.pop("pending_remote_writes", None)
                     _save_state(paths, state)
 
-                # Do not let secret-bearing local content enter the published
-                # manifest. Existing base entries keep the old remote value.
-                effective_files = {k: dict(v) for k, v in local_files.items()}
-                for rel in held:
-                    old = _manifest_entry(base_doc, rel)
-                    if old:
-                        effective_files[rel] = dict(old)
-                    else:
-                        effective_files.pop(rel, None)
-
+                remote_files = _manifest_files(remote_doc or {})
+                base_files = _manifest_files(base_doc)
                 transaction_info = _load_transaction(paths)
                 transaction_plan: SyncPlan | None = None
                 if transaction_info is not None:
                     transaction, transaction_plan = transaction_info
+                    _remember_remote_writes(paths, state, transaction, local_files)
                     if transaction.get("remote_head") != remote_head:
                         # The remote changed while a previous process was
                         # stopped. Replanning is safer than applying stale
@@ -1861,6 +1911,17 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                         paths.transaction.unlink(missing_ok=True)
                         transaction_plan = None
                 if transaction_plan is None:
+                    held = _local_secrets(
+                        local_files, secret_paths, base_files, remote_files,
+                        remote_writes=state.get("pending_remote_writes"),
+                    ) if hold_secrets else set()
+                    effective_files = dict(local_files)
+                    for rel in held:
+                        old = base_files.get(rel)
+                        if old:
+                            effective_files[rel] = dict(old)
+                        else:
+                            effective_files.pop(rel, None)
                     local_with_objects = _local_manifest_with_objects(config, master, str(state["sync_id"]), effective_files)
                     plan = _plan(
                         config,
@@ -1871,13 +1932,22 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                         local_with_objects,
                         remote_doc,
                         remote_head,
-                        set(held),
+                        held,
                     )
                 else:
                     plan = transaction_plan
 
                 if plan.items:
                     if transaction_plan is None:
+                        # An interrupted default run can leave unpublished
+                        # ciphertext behind. Record the policy before writing it.
+                        if not hold_secrets and not state.get("pending_local_secrets") and any(
+                            item.source == "local" and item.path.lower().endswith(".md")
+                            and item.data is not None and contains_secret(item.data.decode("utf-8"))
+                            for item in plan.items
+                        ):
+                            state["pending_local_secrets"] = True
+                            _save_state(paths, state)
                         transaction, encrypted = _transaction_from_plan(
                             paths,
                             plan,
@@ -1891,17 +1961,24 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                     try:
                         written = _apply_plan(config, paths, plan, master, str(state["sync_id"]))
                     except PlanChanged:
+                        _remember_remote_writes(paths, state, _read_json(paths.transaction), {})
+                        paths.transaction.unlink(missing_ok=True)
                         if _attempt + 1 < MAX_SYNC_ATTEMPTS:
                             continue
                         raise SyncBlocked("vault changed during application; three rescans were exhausted")
                 else:
                     written = []
                 # The applied vault is now the source of the next manifest.
-                final_files, final_held, final_unreadable = _scan_vault(config)
+                final_files, final_secrets, final_unreadable = _scan_vault(config)
+                if plan.items:
+                    _remember_remote_writes(paths, state, transaction, final_files, written=written)
                 if final_unreadable:
                     raise SyncBlocked("cannot inspect Markdown before encryption: " + ", ".join(final_unreadable))
-                # Keep held paths at their old base value for the shared view.
-                local_held = set(final_held) - set(plan.remote_secret_paths)
+                local_secrets = _local_secrets(
+                    final_files, final_secrets, base_files, remote_files,
+                    remote_writes=state.get("pending_remote_writes"),
+                )
+                local_held = local_secrets if hold_secrets else set()
                 publish_files = _local_manifest_with_objects(
                     config,
                     master,
@@ -1909,19 +1986,15 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                     {k: dict(v) for k, v in final_files.items() if k not in local_held},
                 )
                 for rel in local_held:
-                    old = _manifest_entry(base_doc, rel)
+                    old = remote_files.get(rel) if rel in plan.remote_secret_paths else base_files.get(rel)
                     if old:
                         publish_files[rel] = dict(old)
-                remote_files = _manifest_files(remote_doc or {})
-                for rel in plan.remote_secret_paths:
-                    if rel in remote_files:
-                        publish_files[rel] = dict(remote_files[rel])
                 local_head = _git_head(paths)
                 previous_hash = str(remote_hash or state.get("accepted_manifest") or "") or None
                 transport_same = {
                     path: entry.get("sha256") for path, entry in publish_files.items()
                 } == {
-                    path: entry.get("sha256") for path, entry in _manifest_files(remote_doc or {}).items()
+                    path: entry.get("sha256") for path, entry in remote_files.items()
                 }
                 if remote_head is not None and not plan.conflicts and transport_same and (local_head is None or local_head == remote_head):
                     if local_head is None:
@@ -1936,6 +2009,9 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                     generation = max(int(state.get("accepted_generation", 0)), int(remote_generation or 0)) + 1
                     # A fresh scan can include remote conflict copies and any
                     # non-conflicting remote changes that were applied.
+                    if not hold_secrets and local_secrets and not state.get("pending_local_secrets"):
+                        state["pending_local_secrets"] = True
+                        _save_state(paths, state)
                     manifest_hash, _tree_hash, encrypted, key_id, committed_files = _write_encrypted_tree(
                         paths,
                         config,
@@ -1970,6 +2046,9 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                         continue
                     raise
                 state.pop("pending_commit", None)
+                state.pop("pending_local_secrets", None)
+                state.pop("pending_remote_writes", None)
+                state.pop("hold_secrets_on_first_sync", None)
                 state.update({
                     "git": "ok",
                     "accepted_generation": generation,
@@ -1981,6 +2060,7 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
                     },
                     "base_commit": commit,
                     "held_secrets": sorted(local_held),
+                    "secret_paths": sorted(final_secrets),
                 })
                 _save_state(paths, state)
 
@@ -2042,7 +2122,7 @@ def key_export(config) -> str:
 
 
 def accept_key(config, sync_id: str, payload: bytes, *, replace: bool = False,
-               key_store: str | None = None) -> SyncResult:
+               key_store: str | None = None, hold_secrets: bool = False) -> SyncResult:
     paths = paths_for(config)
     try:
         data = json.loads(payload.decode("utf-8"))
@@ -2075,6 +2155,8 @@ def accept_key(config, sync_id: str, payload: bytes, *, replace: bool = False,
         })
         if not state.get("remote"):
             raise SyncBlocked("pairing payload did not include a remote URL")
+        if _hold_secrets(hold_secrets):
+            state["hold_secrets_on_first_sync"] = True
         paths.root.mkdir(parents=True, exist_ok=True)
         store_key(config, state, paths, key, replace=replace, key_store=key_store)
         _save_state(paths, state)
@@ -2106,7 +2188,8 @@ def _remote_command(executable: str | None, args: list[str]) -> str:
 
 def pair(config, host: str, *, replace: bool = False, remote_vault: str | None = None,
          remote_bindery: str | None = None, remote_key_store: str | None = None,
-         key_store: str | None = None, peer_remote: str | None = None) -> SyncResult:
+         key_store: str | None = None, peer_remote: str | None = None,
+         hold_secrets: bool = False) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
     key: bytes | None = None
@@ -2126,6 +2209,8 @@ def pair(config, host: str, *, replace: bool = False, remote_vault: str | None =
         ]
         if replace:
             remote_args.append("--replace")
+        if _hold_secrets(hold_secrets):
+            remote_args.append("--hold-secrets")
         payload = _json_bytes({
             "sync_id": state["sync_id"],
             "key": base64.b64encode(key).decode("ascii"),
@@ -2175,7 +2260,7 @@ def scheduler_status(config) -> tuple[str, int | None]:
     return ("installed", interval) if first.exists() and second and second.exists() else ("absent", None)
 
 
-def _scheduler_command(config) -> list[str]:
+def _scheduler_command(config, *, hold_secrets: bool = False) -> list[str]:
     # Do not resolve sys.executable: in a uv/pipx tool environment the venv's
     # python is a symlink to a shared interpreter, and following it leaves the
     # venv, so the job starts a Python that cannot import bindery. Prefer the
@@ -2188,7 +2273,10 @@ def _scheduler_command(config) -> list[str]:
     else:
         found = shutil.which("bindery")
         program = [str(Path(found).absolute())] if found else [str(interpreter), "-m", "bindery"]
-    return [*program, "sync", "--vault", str(config.vault), "--state-dir", str(config.state_dir)]
+    command = [*program, "sync", "--vault", str(config.vault), "--state-dir", str(config.state_dir)]
+    if _hold_secrets(hold_secrets):
+        command.append("--hold-secrets")
+    return command
 
 
 def _systemd_quote(value: str) -> str:
@@ -2207,18 +2295,20 @@ def _run_scheduler_command(command: list[str]) -> None:
         raise SyncError(_short_error(detail) or f"scheduler command failed: {' '.join(command)}")
 
 
-def install_scheduler(config, interval: int = 300, *, write: bool = False, emit: bool = True) -> SyncResult:
+def install_scheduler(config, interval: int = 300, *, write: bool = False, emit: bool = True,
+                      hold_secrets: bool = False) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
     try:
         if interval <= 0:
             raise SyncError("interval must be positive")
         kind, _old, first, second = _scheduler_paths(config)
-        command = " ".join(_systemd_quote(v) for v in _scheduler_command(config))
+        arguments = _scheduler_command(config, hold_secrets=hold_secrets)
+        command = " ".join(_systemd_quote(v) for v in arguments)
         if kind == "macos":
             import plistlib
             label = first.stem
-            plist = {"Label": label, "ProgramArguments": _scheduler_command(config), "StartInterval": interval, "RunAtLoad": True, "StandardOutPath": str(paths.root / "scheduler.log"), "StandardErrorPath": str(paths.root / "scheduler.log")}
+            plist = {"Label": label, "ProgramArguments": arguments, "StartInterval": interval, "RunAtLoad": True, "StandardOutPath": str(paths.root / "scheduler.log"), "StandardErrorPath": str(paths.root / "scheduler.log")}
             rendered = plistlib.dumps(plist).decode("utf-8")
         else:
             rendered = f"[Unit]\nDescription=Bindery encrypted sync\n\n[Service]\nType=oneshot\nExecStart={command}\n"
@@ -2278,7 +2368,7 @@ def uninstall_scheduler(config, *, write: bool = False, emit: bool = True) -> Sy
 
 
 def rekey(config, *, write: bool = False, purge_remote: bool = False,
-          key_store: str | None = None) -> SyncResult:
+          key_store: str | None = None, hold_secrets: bool = False) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
     if not write:
@@ -2286,10 +2376,11 @@ def rekey(config, *, write: bool = False, purge_remote: bool = False,
     if not state.get("configured") or not state.get("sync_id"):
         return SyncResult(2, _status_from_state(config), "sync is not initialized")
     try:
+        hold_secrets = _hold_secrets(hold_secrets) or bool(state.get("hold_secrets_on_first_sync"))
         # Rekeying is a root replacement, so it must never be used as a way to
         # skip an ordinary fetch/merge/apply/push cycle first.  This also makes
         # the Vault contents below the result of the latest shared state.
-        preflight = run_sync(config, key_store=key_store)
+        preflight = run_sync(config, key_store=key_store, hold_secrets=hold_secrets)
         if preflight.exit_code != 0:
             return SyncResult(
                 preflight.exit_code,
@@ -2327,20 +2418,33 @@ def rekey(config, *, write: bool = False, purge_remote: bool = False,
                     raise SyncBlocked("rekey requires the local HEAD and remote HEAD to be the same after sync")
                 _initialise_repo(temp_paths, remote, write=True)
                 _ensure_format(temp_paths, write=True)
-                files, held, unreadable = _scan_vault(config)
+                files, secret_paths, unreadable = _scan_vault(config)
                 if unreadable:
                     raise SyncBlocked("cannot rekey unreadable Markdown: " + ", ".join(unreadable))
+                base_files = _manifest_files(_base_from_state(state))
+                held = _local_secrets(files, secret_paths, base_files) if hold_secrets else set()
                 for rel in held:
                     files.pop(rel, None)
-                manifest_files = _local_manifest_with_objects(config, new_key, str(state["sync_id"]), files)
+                sync_id = str(state["sync_id"])
+                manifest_files = _local_manifest_with_objects(config, new_key, sync_id, files)
+                # Rotate the last shared version of a held edit under the new key.
+                previous = {rel: base_files[rel] for rel in held if rel in base_files}
+                manifest_files.update(previous)
+
+                def read_previous(rel: str) -> bytes | None:
+                    if rel in previous:
+                        return _content_for_entry(paths, old_key, sync_id, previous[rel], commit=expected_remote)
+                    return None
+
                 manifest_hash, _tree_hash, encrypted, _key_id, committed_files = _write_encrypted_tree(
                     temp_paths,
                     config,
                     new_key,
-                    str(state["sync_id"]),
+                    sync_id,
                     manifest_files,
                     1,
                     None,
+                    read_previous=read_previous,
                 )
                 commit = _git_commit(temp_paths, local_head=None, remote_head=None)
                 _push(temp_paths, commit, force=True, expected_remote=expected_remote)
@@ -2364,6 +2468,7 @@ def rekey(config, *, write: bool = False, purge_remote: bool = False,
                     "base_manifest": {"generation": 1, "previous_hash": None, "files": committed_files},
                     "base_commit": commit,
                     "held_secrets": sorted(held),
+                    "secret_paths": sorted(secret_paths),
                     "git": "ok",
                     "index": "ok",
                     "last_success": _now(),
