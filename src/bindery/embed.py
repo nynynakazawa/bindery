@@ -13,6 +13,7 @@ token cost the project exists to remove.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Protocol
 
 
@@ -45,18 +46,19 @@ class _FastEmbedBackend:
 
     name = "fastembed"
 
-    def __init__(self) -> None:
+    def __init__(self, *, local_files_only: bool = False) -> None:
         from fastembed import TextEmbedding  # type: ignore[import-not-found]
 
         try:
             available = {m["model"]: m for m in TextEmbedding.list_supported_models()}
         except Exception:
             available = {}
+        options = {"local_files_only": True} if local_files_only else {}
         for candidate in MULTILINGUAL_MODELS:
             if available and candidate not in available:
                 continue
             try:
-                self._model = TextEmbedding(model_name=candidate)
+                self._model = TextEmbedding(model_name=candidate, **options)
             except Exception:
                 continue
             self.model_name = candidate
@@ -74,13 +76,14 @@ class _SentenceTransformersBackend:
 
     name = "sentence-transformers"
 
-    def __init__(self) -> None:
+    def __init__(self, *, local_files_only: bool = False) -> None:
         from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
 
         last: Exception | None = None
+        options = {"local_files_only": True} if local_files_only else {}
         for candidate in MULTILINGUAL_MODELS:
             try:
-                self._model = SentenceTransformer(candidate)
+                self._model = SentenceTransformer(candidate, **options)
             except Exception as exc:
                 last = exc
                 continue
@@ -94,40 +97,27 @@ class _SentenceTransformersBackend:
         return [list(map(float, vec)) for vec in vectors]
 
 
-#: Resolved once per process. ``False`` records "looked, found nothing", which
-#: is different from "not looked yet" - without that distinction every search
-#: on a machine with no backend installed would retry two imports.
-_BACKEND: "EmbeddingBackend | None | bool" = False
-
-
-def load_backend() -> EmbeddingBackend | None:
+@lru_cache(maxsize=2)
+def load_backend(*, local_files_only: bool = False) -> EmbeddingBackend | None:
     """Return the first available backend, or ``None`` when none is installed.
 
-    Cached, because constructing a backend loads an ONNX model from disk - a
-    matter of seconds. This is called on every semantic search and after every
-    write, so paying that once per process rather than once per call is the
-    difference between semantic search being usable and being unusable.
+    Cache by mode, including misses. A dashboard search only uses cached model
+    files, and a cache miss must not prevent later explicit model setup.
 
     A missing backend is a normal, supported state rather than an error: the
     keyword index alone is a working system.
     """
-    global _BACKEND
-    if _BACKEND is not False:
-        return _BACKEND  # type: ignore[return-value]
     for factory in (_FastEmbedBackend, _SentenceTransformersBackend):
         try:
-            _BACKEND = factory()  # type: ignore[assignment]
-            return _BACKEND  # type: ignore[return-value]
+            return factory(local_files_only=local_files_only)
         except Exception:
             continue
-    _BACKEND = None
     return None
 
 
 def reset_backend() -> None:
     """Forget the cached backend. For tests."""
-    global _BACKEND
-    _BACKEND = False
+    load_backend.cache_clear()
 
 
 def cosine(a: list[float], b: list[float]) -> float:

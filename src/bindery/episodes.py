@@ -30,6 +30,7 @@ from .config import Config
 from .indexer import EPISODE_PREFIX, index_path
 from .redact import redact
 from .safeio import atomic_write, file_lock
+from .sync import machine_label, sync_is_configured, vault_lock
 from .store import Store
 from .tokens import estimate_tokens
 
@@ -232,7 +233,8 @@ def _episode_path(config: Config, ref: SessionRef, project: str) -> str:
     day = datetime.datetime.fromtimestamp(ref.modified or 0).date().isoformat()
     short = ref.session_id.replace("-", "")[:8] or "unknown"
     folder = project or "_global"
-    return f"{EPISODE_PREFIX}{folder}/{day}-{ref.client}-{short}.md"
+    suffix = f".{machine_label(config)}" if sync_is_configured(config) else ""
+    return f"{EPISODE_PREFIX}{folder}/{day}-{ref.client}-{short}{suffix}.md"
 
 
 def _title(session: Session) -> str:
@@ -320,7 +322,9 @@ def _write_episode(config: Config, store: Store, session: Session) -> str:
     ]
     text = "\n".join(front) + body.lstrip("\n") + "\n"
 
-    with file_lock(target, config.state_dir):
-        atomic_write(target, text)
+    with vault_lock(config):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(target, config.state_dir):
+            atomic_write(target, text)
     index_path(config, store, target)
     return rel

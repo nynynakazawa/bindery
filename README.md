@@ -1,13 +1,13 @@
 # Bindery
 
-**One shared memory for Claude Code and Codex.**
+**One shared memory for Claude Code, Codex, and Antigravity CLI.**
 
 [日本語版 README](README.ja.md)
 
 Bindery is an [MCP](https://modelcontextprotocol.io) server that gives your
 coding agents a single, persistent knowledge base, **scoped to the project
-you are in**. Claude Code writes a decision down; Codex finds it in the next
-session. Notes that agents actually read get ranked higher and ones that stop
+you are in**. A decision written by one client can be found by another.
+Notes that agents actually read get ranked higher and ones that stop
 being read fade, so the memory sharpens with use. Your notes stay as plain
 Markdown on disk, so Obsidian, `grep`, and `git` all keep working.
 
@@ -25,9 +25,9 @@ re-explanation is pure token cost, paid again on every new terminal.
 loading it is slow, and loading *part* of it means guessing which part. Past a
 certain size the agent either runs out of context or reads the wrong files.
 
-**Two agents means two memories.** Claude Code and Codex each have their own
-native memory (`CLAUDE.md`, `AGENTS.md`, Codex Memories). None of it crosses
-over. Work done in one is invisible to the other.
+**Every agent keeps its own memory.** Claude Code and Codex each have native
+memory files (`CLAUDE.md`, `AGENTS.md`, Codex Memories), but those do not cross
+over. Work done in one is invisible to another unless they share a knowledge base.
 
 **A memory that only stores is a filing cabinet.** Notes pile up, nothing is ever
 consolidated, and nobody can tell which ones are earning their keep or what the
@@ -35,7 +35,7 @@ collection is missing.
 
 Bindery answers all three with one idea: **keep the Markdown, replace the
 loading.** Notes stay files. Retrieval becomes a search that returns matching
-passages under a hard token budget, from an index both agents share.
+passages under a hard token budget, from an index all connected agents share.
 
 ---
 
@@ -102,7 +102,7 @@ Cut on purpose, to keep the tool surface and the install small:
 
 | Omitted | Why |
 | --- | --- |
-| Cloud sync, team workspaces | Local-first. Your notes are your files. |
+| Hosted cloud sync, team workspaces | Bindery does not run a hosted sync service. Encrypted sync to an opt-in Git remote is available for a remote you control. |
 | Accounts, auth, multi-tenancy | Single-user tool. |
 | LLM-based memory extraction | It would call a paid API on every write - the opposite of the goal. |
 | Whole-codebase AST indexing | A different problem. Use a code-intelligence server alongside this. |
@@ -254,17 +254,17 @@ the instruction block pasted somewhere of your choosing. Otherwise skip to
 
 ## Connect your agents
 
-Neither agent is the primary one. `install` with no argument emits the
+No single client is the primary one. `install` with no argument emits the
 configuration for every supported client and tells you which it can see:
 
 ```bash
 bindery install              # print config for all clients
 bindery install --write      # apply it (backs up first, never clobbers
                                   # servers you already configured)
-bindery install codex        # or just one
+bindery install antigravity # or just Antigravity CLI
 ```
 
-For reference, the two forms it produces:
+For reference, here are examples of the forms it produces:
 
 ```jsonc
 // Claude Code - .mcp.json
@@ -283,6 +283,29 @@ args = ["serve"]
 BINDERY_VAULT = "/Users/you/Obsidian/MyVault"
 ```
 
+```jsonc
+// Antigravity CLI - ~/.gemini/config/mcp_config.json
+{ "mcpServers": { "bindery": {
+    "command": "bindery", "args": ["serve"],
+    "env": { "BINDERY_VAULT": "/Users/you/Obsidian/MyVault" } } } }
+```
+
+With `--local`, Antigravity CLI uses `.agents/mcp_config.json` in the project.
+
+For Antigravity CLI, `install` writes the Vault and environment-backed index
+boundaries into both the server arguments and its environment. It also writes
+the project scope as an explicit `--project` argument, so `--include`,
+`--exclude`, and project scope remain in force even when the client does not
+pass the environment through unchanged. Confirm the registration with:
+
+```bash
+agy mcp list
+```
+
+The configuration paths above were checked with agy 1.4.2 and agy 1.5.13.
+At project scope, Antigravity also reads the existing `AGENTS.md`, so the
+project instruction block written by `bindery prompt --write` applies there.
+
 **Point every client at the same `BINDERY_VAULT`.** That single shared value
 is what makes the memory shared - the index location is derived from it.
 
@@ -295,7 +318,7 @@ so nothing is written unless the agent decides to write it. These instructions
 are that decision:
 
 ```bash
-bindery prompt --global --write   # ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md
+bindery prompt --global --write   # also writes ~/.gemini/GEMINI.md when ~/.gemini exists
 bindery prompt --write            # or just this project's CLAUDE.md / AGENTS.md
 bindery prompt                    # or print, and paste where you like
 ```
@@ -394,11 +417,117 @@ bindery setup [--write]          # everything below, in one pass
 bindery review [--json] [--min-count N]
 bindery install [claude|codex] [--write]
 bindery prompt [--write] [--global]
+bindery status --json             # one JSON object for Bindery.app
+bindery clients --json            # detected clients and live connections
+bindery sync init --remote <URL>  # preview an encrypted remote
+bindery sync init --remote <URL> --write
+bindery sync                      # one encrypted sync run
+bindery sync status --json
+bindery sync init --remote <URL> --key-store file --write
+bindery sync pair <ssh-host> --remote-key-store file
+bindery sync install --interval 300 --write
+bindery sync uninstall --write
 ```
+
+When a sync operation fails with `--json`, stdout remains one JSON status object,
+the `error` field contains the cause, and the command keeps its non-zero exit
+code. A one-line summary is also written to stderr; key material is omitted.
 
 `review` is the one to run every few weeks. It answers: what did the agents keep
 asking that I never wrote down, which notes are doing the work, and what has
 turned into clutter.
+
+## Encrypted vault sync
+
+Bindery can synchronise one Vault between machines through a Git remote that you
+control. The Vault itself is never a Git working tree. Bindery keeps the local
+transport repository under `~/.bindery/sync/<vault-key>/repo`; its Git objects
+contain only `format.json`, `manifest.enc`, and AES-GCM ciphertext blobs named
+by HMAC-derived identifiers.
+
+The remote must be an SSH URL, scp-style destination, `file://` URL, or absolute
+local path. Passwords, `ext::`, HTTP remotes, and public hosts such as GitHub,
+GitLab, and Bitbucket are refused unless `--allow-public-host` is supplied.
+For a private Mac mini on Tailscale, create a bare repository on that machine,
+then run `sync init` and `sync` on the first Vault. On the second machine,
+`sync pair <ssh-host>` sends the key, remote URL, and trust checkpoint over SSH
+standard input, so it can start syncing without `sync init`. Run one sync on
+each machine.
+
+```bash
+git init --bare ~/bindery-sync/zawabooks.git       # on the private host
+bindery sync init --remote nakazawaserver:bindery-sync/zawabooks.git --write
+bindery sync
+bindery sync pair nakazawaserver --replace         # on the first machine
+bindery sync                                            # on the paired machine
+```
+
+The master key is 32 random bytes. Bindery derives separate AES-256-GCM,
+HMAC-name, and key-ID keys with HKDF-SHA256. `--key-store auto` is the default
+and can also be set with `BINDERY_KEY_STORE`. On macOS it tries the Keychain
+under service `bindery-sync`; if a non-interactive session receives
+"User interaction is not allowed" it falls back to a `0600` file in the state
+directory. `--key-store keychain` or `--key-store file` selects one explicitly.
+The selected store is recorded as `key_store` in sync state and status; the key
+itself is never written to state JSON. `sync pair --remote-key-store` selects
+the store requested on the peer, including when the peer runs `accept-key` from
+a scheduler or an SSH session.
+
+File storage is on the same device as the plaintext Vault. The protected target
+does not change: the remote and its backups remain the data that the encryption
+is intended to protect. Device backups include the key when they include the
+state directory, so protect those backups accordingly. The key never enters
+Git, the Vault, logs, or process arguments. `bindery sync key export` prints a
+recovery string with a warning; store it in a password manager. Losing the key
+leaves each local plaintext Vault intact, but makes the remote ciphertext
+unreadable.
+
+The manifest is encrypted too. It records relative paths, object IDs, SHA-256
+hashes, byte sizes, and the machine label that last wrote a file. Each
+manifest has a monotonic generation and a `previous_hash` link. Bindery follows
+authenticated manifests back to the accepted checkpoint; Git parent links are
+not used as trust evidence.
+AES-GCM authentication failures, generation rollback, disconnected history,
+unsafe paths, and non-Markdown conflicts stop the run as `blocked`. Markdown
+conflicts keep both versions under a deterministic `.conflict-<sha12>.md` name;
+the content hash decides which version remains at the original path. Generated
+conflict copies are three-way targets too. If the same plan updates such a copy,
+the existing bytes are retained under that copy's own deterministic
+`.conflict-<sha12>.md` name. The
+machine registry is `.bindery-sync/machines.json`, and a reused label with a
+different machine ID is blocked.
+
+If the remote manifest still tracks a path that is now outside the configured
+boundary, sync stops and names the path. Remove it deliberately after checking
+that the deletion should propagate to every machine; Bindery never silently
+untracks it.
+
+This protects note contents and path names in the remote and in transit from a
+remote observer or a tampered remote. It does not protect a machine that has
+both the plaintext Vault and the key. Git still reveals commit count and order,
+file count, ciphertext sizes, and update frequency. The regular-expression
+secret detector can miss short or unknown credential formats. A secret held in
+the local Vault is not sent; it remains visible locally and is reported in
+`sync status`.
+
+The transaction is stored with encrypted object references, so a stopped apply
+can resume without putting plaintext in state. Conflict copies are written
+before the primary path, and an apply hash mismatch discards the plan and
+rescans up to three times in one run. Encryption counts are tracked per key ID
+and increment only for actual encryption calls.
+
+The scheduler is opt-in and defaults to a dry run. `sync install --write`
+creates a user LaunchAgent on macOS or a systemd user service and timer on
+Linux. Before creating a new key, `sync rekey --write` fetches and completes a
+normal sync, including merge, apply, and push. It checks that local and remote
+HEADs match, then uses a force-with-lease push for the new root. If a peer
+changes the remote HEAD while the root is being built, the push is rejected and
+the old key remains active. The old key and local transport repository are
+archived instead of deleted.
+Rekeying requires pairing every machine again. Old Git objects can remain readable with the old key through reflogs,
+unreachable objects, and backups. Removing them requires a separate remote
+maintenance step such as `git reflog expire --expire=now --all && git gc
+--prune=now`; remote backups must be removed separately.
 
 ## Configuration
 
@@ -406,6 +535,7 @@ turned into clutter.
 | --- | --- | --- |
 | `BINDERY_VAULT` | `./memory` | Directory of Markdown notes. |
 | `BINDERY_STATE_DIR` | `~/.bindery` | Where the index lives. |
+| `BINDERY_KEY_STORE` | `auto` | Sync key storage: `auto`, `keychain`, or `file`. |
 | `BINDERY_MAX_TOKENS` | `2000` | Default search response cap. |
 | `BINDERY_LIMIT` | `8` | Default passages per search. |
 | `BINDERY_CHUNK_TOKENS` | `400` | Target passage size. |
@@ -423,6 +553,7 @@ turned into clutter.
 | Claude Code — app, CLI, and VS Code extension | `~/.claude.json` |
 | Codex — CLI, IDE extension, app | `~/.codex/config.toml` |
 | Codex, per-account (`codex-multi`) | `~/.codex-homes/<account>/config.toml` |
+| Antigravity CLI | `~/.gemini/config/mcp_config.json` (or `.agents/mcp_config.json` per project) |
 | VS Code, Copilot agent mode | `~/Library/Application Support/Code/User/mcp.json` |
 | Cursor | `~/.cursor/mcp.json` |
 
@@ -475,7 +606,7 @@ living on different scales.
 nothing to rescan. The server also rescans on startup, so edits made in Obsidian
 while no agent was running are picked up automatically.
 
-**Concurrency.** SQLite in WAL mode with a busy timeout, so both agents can hold
+**Concurrency.** SQLite in WAL mode with a busy timeout, so connected agents can hold
 the index open at once.
 
 ### The growth loop

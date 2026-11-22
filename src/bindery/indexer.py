@@ -187,26 +187,29 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     return {}, text
 
 
-def _split_tags(raw: str) -> list[str]:
-    cleaned = raw.strip().strip("[]")
+def parse_tags(raw: str) -> list[str]:
+    cleaned = raw.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
     return [part.strip().strip("\"'") for part in cleaned.split(",") if part.strip()]
+
+
+def note_title(path: Path, meta: dict[str, str], body: str) -> str:
+    title = meta.get("title") or meta.get("name")
+    if title:
+        return title
+    for line in body.splitlines():
+        match = HEADING_RE.match(line)
+        if match:
+            return match.group(2).strip() or path.stem
+    return path.stem
 
 
 def parse_note(path: Path, text: str) -> ParsedNote:
     meta, body = parse_frontmatter(text)
-    title = meta.get("title") or meta.get("name") or ""
-    if not title:
-        for line in body.splitlines():
-            match = HEADING_RE.match(line)
-            if match:
-                title = match.group(2).strip()
-                break
-    if not title:
-        title = path.stem
-    tags = _split_tags(meta.get("tags", ""))
     links = sorted({m.group(1).strip() for m in WIKILINK_RE.finditer(text)})
     return ParsedNote(
-        title=title, tags=tags, body=body, links=links,
+        title=note_title(path, meta, body), tags=parse_tags(meta.get("tags", "")), body=body, links=links,
         project=str(meta["project"]).strip() if "project" in meta else None,
     )
 
@@ -348,14 +351,29 @@ def digest_of(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
+def _inside_vault(path: Path, vault: Path) -> Path | None:
+    """Return the real path only when it remains inside the real vault."""
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(vault.resolve())
+    except ValueError:
+        return None
+    return resolved
+
+
 def iter_markdown(config: Config):
+    seen: set[Path] = set()
     for path in sorted(config.vault.rglob("*.md")):
         if any(part in SKIP_DIRS for part in path.parts):
             continue
-        rel = str(path.relative_to(config.vault))
+        real_path = _inside_vault(path, config.vault)
+        if real_path is None or real_path in seen:
+            continue
+        seen.add(real_path)
+        rel = str(real_path.relative_to(config.vault.resolve()))
         if not is_indexable(rel, include=config.include, exclude=config.exclude):
             continue
-        yield path
+        yield real_path
 
 
 @dataclass(slots=True)
@@ -454,8 +472,11 @@ def index_path(config: Config, store: Store, path: Path, *, force: bool = False)
     the lesson was worth.
     """
     report = IndexReport()
+    path = _inside_vault(path, config.vault)
+    if path is None:
+        return report
     try:
-        rel = str(path.relative_to(config.vault))
+        rel = str(path.relative_to(config.vault.resolve()))
     except ValueError:
         return report
     if not is_indexable(rel, include=config.include, exclude=config.exclude):

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-electron/
+release/
+.vite/
+.vitest-cache/
+
+# These build and copy files are part of the app even with a global *.json ignore.
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/tsconfig.electron.json
+!/src/copy/ja.json
+!/src/copy/en.json

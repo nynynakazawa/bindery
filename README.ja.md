@@ -1,13 +1,13 @@
 # Bindery
 
-**Claude Code と Codex で、ひとつの記憶を共有する。**
+**Claude Code、Codex、Antigravity CLI で、ひとつの記憶を共有する。**
 
 [English README](README.md)
 
 Bindery は、コーディングエージェントに永続的な共有知識ベースを与える
 [MCP](https://modelcontextprotocol.io) サーバーです。しかも**いま作業している
-プロジェクトにスコープされます**。Claude Code が書き残した判断を、次のセッションの
-Codex が見つけられます。エージェントが実際に読んだノートは上位に、読まれなくなった
+プロジェクトにスコープされます**。あるクライアントが書き残した判断を、別の
+クライアントから見つけられます。エージェントが実際に読んだノートは上位に、読まれなくなった
 ノートは静かに沈むので、使うほど精度が上がります。ノートはディスク上の素の
 Markdown のままなので、Obsidian も `grep` も `git` もそのまま使えます。
 
@@ -42,8 +42,8 @@ Bindery はこの3つに、ひとつの考え方で答えます。
 
 ## できること
 
-- **エージェント間で共有される。** 両クライアントが同じ Vault を指せば、
-  同じインデックスを見ます。片方が書いたノートは、もう片方からすぐ検索できます。
+- **エージェント間で共有される。** 接続したクライアントが同じ Vault を指せば、
+  同じインデックスを見ます。あるクライアントが書いたノートは、ほかからすぐ検索できます。
 - **ファイル単位ではなく箇所単位で返す。** ノートは Markdown の見出しで分割され、
   ヒットした節だけが返ります。文書全体は返りません。
 - **トークン上限が効く。** 検索応答には必ず上限（既定 2,000 トークン）がかかります。
@@ -98,7 +98,7 @@ Bindery はこの3つに、ひとつの考え方で答えます。
 
 | 落とした機能                       | 理由                                                                                                                                                         |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| クラウド同期、チームワークスペース | ローカルファースト。ノートはあなたのファイルです。                                                                                                           |
+| ホスト型クラウド同期、チームワークスペース | Bindery は同期サービスを運営しません。利用者が管理する Git リモートへの暗号化同期だけを opt-in で使えます。 |
 | アカウント、認証、マルチテナント   | 個人用ツールだからです。                                                                                                                                     |
 | LLM によるメモリ抽出               | 書き込みのたびに課金 API を呼ぶことになり、目的と正反対です。                                                                                                |
 | コードベース全体の AST 索引        | 別の問題です。必要ならコード解析サーバーを併用してください。                                                                                                 |
@@ -250,17 +250,17 @@ bindery project which ~/work/Product/Sales    # なぜそう判定されたか
 
 ## エージェントに繋ぐ
 
-**どちらのエージェントも主ではありません。** 引数なしの `install` は対応する
+**特定のクライアントに限定されません。** 引数なしの `install` は対応する
 全クライアントの設定を出力し、どれが検出できたかも表示します。
 
 ```bash
 bindery install              # 全クライアント分を表示
 bindery install --write      # 実際に書き込む（先にバックアップを取り、
                                   # 既存の他サーバー設定は壊しません）
-bindery install codex        # 片方だけにすることも可能
+bindery install antigravity # Antigravity CLI だけにすることも可能
 ```
 
-出力される2形式:
+出力例:
 
 ```jsonc
 // Claude Code - .mcp.json
@@ -279,6 +279,29 @@ args = ["serve"]
 BINDERY_VAULT = "/Users/you/Obsidian/MyVault"
 ```
 
+```jsonc
+// Antigravity CLI - ~/.gemini/config/mcp_config.json
+{ "mcpServers": { "bindery": {
+    "command": "bindery", "args": ["serve"],
+    "env": { "BINDERY_VAULT": "/Users/you/Obsidian/MyVault" } } } }
+```
+
+`--local` を付けると、Antigravity CLI はプロジェクト内の
+`.agents/mcp_config.json` に登録されます。
+
+Antigravity CLI 用の設定には、Vault と環境変数で指定する索引境界をサーバーの引数と
+環境変数の両方に書き込みます。プロジェクトの範囲も `--project` 引数で渡すため、
+クライアントが環境変数をそのまま渡さない場合でも、`--include`、`--exclude`、プロジェクトの
+範囲を保てます。登録内容は次で確認できます。
+
+```bash
+agy mcp list
+```
+
+設定先は agy 1.4.2 と agy 1.5.13 で確認しました。プロジェクト単位では、
+Antigravity CLI も既存の `AGENTS.md` を読むため、`bindery prompt --write` が書く
+プロジェクト用の指示ブロックが適用されます。
+
 **すべてのクライアントで `BINDERY_VAULT` を同じ値にしてください。**
 インデックスの場所はこの値から導出されるため、ここが揃っていることが
 「記憶が共有される」ことの条件そのものです。
@@ -292,7 +315,7 @@ MCP サーバーは呼ばれたら答えることしかできません。**エ�
 しない限り何も残りません。その判断を作るのがこの指示文です。
 
 ```bash
-bindery prompt --global --write   # ~/.claude/CLAUDE.md と ~/.codex/AGENTS.md
+bindery prompt --global --write   # ~/.gemini があれば ~/.gemini/GEMINI.md も書く
 bindery prompt --write            # このプロジェクトの CLAUDE.md / AGENTS.md のみ
 bindery prompt                    # 表示だけして好きな場所に貼る
 ```
@@ -387,10 +410,94 @@ bindery setup [--write]          # 以下をまとめて実行
 bindery review [--json] [--min-count N]
 bindery install [claude|codex] [--write]
 bindery prompt [--write] [--global]
+bindery status --json             # Bindery.app 向けの JSON を1つ出す
+bindery clients --json            # クライアントと接続中のサーバー
+bindery sync init --remote <URL>  # 暗号化リモートの確認だけをする
+bindery sync init --remote <URL> --write
+bindery sync                      # 1回だけ暗号化同期する
+bindery sync status --json
+bindery sync init --remote <URL> --key-store file --write
+bindery sync pair <ssh-host> --remote-key-store file
+bindery sync install --interval 300 --write
+bindery sync uninstall --write
 ```
+
+`--json` で同期に失敗した場合も、標準出力は JSON の状態オブジェクトだけです。
+`error` に原因を入れ、終了コードは非ゼロのまま返します。標準エラー出力にも原因を1行で表示しますが、
+鍵などの秘密は含めません。
 
 数週間に一度回すべきなのは `review` です。「エージェントが何度も聞いたのに
 書いていなかったこと」「実際に働いているノート」「散らかり始めたもの」が分かります。
+
+## Vault の暗号化同期
+
+Bindery は、利用者が管理する Git リモートを通して Vault を複数の端末で同期できます。
+Vault 自体は Git の作業ツリーにしません。同期用のローカルリポジトリは
+`~/.bindery/sync/<vault-key>/repo` に置き、Git オブジェクトには `format.json`、
+`manifest.enc`、HMAC から作った名前の暗号文だけを保存します。
+
+リモートに使えるのは SSH URL、scp 形式、`file://` URL、絶対パスです。パスワードを含む URL、
+`ext::`、HTTP リモート、GitHub・GitLab・Bitbucket などの公開ホストは拒否します。
+公開ホストを明示的に許可する場合だけ `--allow-public-host` を付けてください。
+Tailscale 上の Mac mini を使う場合は、Mac mini に bare リポジトリを作り、最初の端末で
+`sync init` と `sync` を実行します。2台目は `sync pair <ssh-host>` で SSH の標準入力から鍵、
+リモート URL、信頼チェックポイントを受け取り、`sync init` なしで同期を始められます。
+両方で1回ずつ同期します。
+
+```bash
+git init --bare ~/bindery-sync/zawabooks.git       # 非公開ホスト側
+bindery sync init --remote nakazawaserver:bindery-sync/zawabooks.git --write
+bindery sync
+bindery sync pair nakazawaserver --replace         # 最初の端末から
+bindery sync                                            # ペアリングした端末で
+```
+
+マスター鍵は乱数で作る32バイトです。HKDF-SHA256 で AES-256-GCM 用、名前用 HMAC、鍵 ID 用の
+鍵を分けます。既定の `--key-store auto` は `BINDERY_KEY_STORE` でも指定できます。macOS では
+Keychain の service `bindery-sync` を試し、GUI のない SSH セッションで `User interaction is not
+allowed` になった場合だけ state ディレクトリ内の `0600` ファイルへ切り替えます。
+`--key-store keychain` と `--key-store file` で保管先を固定できます。実際に使った保管先は
+同期状態と status の `key_store` に記録しますが、鍵そのものは state JSON に書きません。
+`sync pair --remote-key-store` で相手機の保管先も指定できます。scheduler や SSH セッションから
+実行しても、state に記録した保管先を使います。
+
+file 保管は平文 Vault と同じ端末上にあります。守る対象は変わりません。リモートとそのバックアップ
+を暗号化して守ります。端末のバックアップに state ディレクトリが含まれると鍵も入るため、バックアップ
+の扱いに注意してください。鍵は Git、Vault、ログ、プロセスの引数に出しません。`bindery sync key
+export` は警告付きで回復用文字列を表示するため、パスワードマネージャに保管してください。鍵を失うと
+リモートの暗号文は読めなくなりますが、各端末の平文 Vault は残ります。
+
+manifest も暗号化します。中には相対パス、オブジェクト ID、SHA-256、サイズ、最後に書いた機械
+ラベルを記録します。manifest には単調増加する世代番号と `previous_hash` を持たせます。受信した
+manifest から受理済みチェックポイントまでハッシュ連鎖をたどれない場合は、Git の親関係にかかわらず
+停止します。
+AES-GCM の認証失敗、世代の巻き戻し、履歴の断絶、安全でないパス、Markdown 以外の内容競合は
+`blocked` で停止します。Markdown の競合では両方の版を決定的な
+`.conflict-<sha12>.md` に残し、内容ハッシュの辞書順で大きい版を元のパスに置きます。生成済みの
+衝突コピー自身も 3-way の対象です。同じ計画でそのパスを更新する場合は、既存内容をそのコピーの
+`.conflict-<sha12>.md` に退避します。
+機械登録は `.bindery-sync/machines.json` に保存し、同じラベルを別の機械が使うと停止します。
+リモートの manifest に、現在の境界の外になったパスが残っていれば、パスを表示して同期を止めます。
+全端末へ削除を伝えてよいことを確認してから手動で追跡を外します。Bindery は黙って追跡を外しません。
+
+この方式が守るのは、リモートや通信経路から見たノート本文とパス名です。平文 Vault と鍵を持つ
+端末そのものが侵害された場合は守れません。Git からはコミット数と順序、ファイル数、暗号文の
+サイズ、更新頻度が分かります。秘密検出は正規表現なので、短い値や未知の形式を見逃すことがあります。
+端末内で秘密を検出したファイルは送らず、ローカルに残して `sync status` に保留数を表示します。
+
+計画は state に暗号化 object の参照を保存するため、停止後も残りの書き込みを再開できます。衝突時は
+衝突コピーを先に書き、元パスを最後に書きます。適用中のハッシュ不一致は計画を破棄し、同じ実行内で
+最大3回走査します。暗号化回数は鍵 ID ごとに実際の暗号化だけを数えます。
+
+スケジューラは opt-in で、既定はドライランです。`sync install --write` は macOS ではユーザーの
+LaunchAgent、Linux では systemd user service と timer を作ります。鍵を交換する
+`sync rekey --write` は新しい鍵を作る前に fetch し、通常の同期（統合、適用、push）を成功させます。
+ローカルの同期 HEAD とリモート HEAD が一致したことを確認して新しい根を作り、観測した HEAD を lease
+に指定して force push します。根の作成中に別端末が push して HEAD が変わると push を拒否し、旧鍵を
+残したまま中止します。成功後は旧鍵と旧ローカルリポジトリを退避します。
+全端末の再ペアリングが必要です。古い Git オブジェクトは reflog、到達不能
+オブジェクト、バックアップに残り、旧鍵で読める場合があります。必要ならリモートで
+`git reflog expire --expire=now --all && git gc --prune=now` を実行し、バックアップは別に削除してください。
 
 ## 設定
 
@@ -399,6 +506,7 @@ bindery prompt [--write] [--global]
 | ------------------------ | -------------- | ------------------------------------------ |
 | `BINDERY_VAULT`        | `./memory`   | Markdown ノートのディレクトリ。          |
 | `BINDERY_STATE_DIR`    | `~/.bindery` | インデックスの保存先。                   |
+| `BINDERY_KEY_STORE`    | `auto`       | 同期鍵の保管先。`auto`、`keychain`、`file`。 |
 | `BINDERY_MAX_TOKENS`   | `2000`       | 検索応答の既定上限。                     |
 | `BINDERY_LIMIT`        | `8`          | 1検索あたりの既定件数。                  |
 | `BINDERY_CHUNK_TOKENS` | `400`        | 分割後の1箇所の目標サイズ。              |
@@ -416,6 +524,7 @@ bindery prompt [--write] [--global]
 | Claude Code — アプリ / CLI / VS Code 拡張 | `~/.claude.json` |
 | Codex — CLI / IDE拡張 / アプリ | `~/.codex/config.toml` |
 | Codex のアカウント別ホーム（`codex-multi`） | `~/.codex-homes/<アカウント>/config.toml` |
+| Antigravity CLI | `~/.gemini/config/mcp_config.json`（プロジェクト単位なら `.agents/mcp_config.json`） |
 | VS Code（Copilot エージェントモード） | `~/Library/Application Support/Code/User/mcp.json` |
 | Cursor | `~/.cursor/mcp.json` |
 

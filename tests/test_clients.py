@@ -9,6 +9,7 @@ never learn what it failed to record.
 from __future__ import annotations
 
 import json
+import tomllib
 
 import pytest
 
@@ -32,6 +33,7 @@ def home(tmp_path, monkeypatch):
     root = tmp_path / "home"
     (root / ".claude").mkdir(parents=True)
     (root / ".codex").mkdir(parents=True)
+    (root / ".gemini" / "antigravity-cli").mkdir(parents=True)
     (root / ".cursor").mkdir(parents=True)
     (root / "Library" / "Application Support" / "Code" / "User").mkdir(parents=True)
     (root / ".codex-homes" / "codexb").mkdir(parents=True)
@@ -51,7 +53,8 @@ def _vscode(home):
 def test_every_client_on_the_machine_is_a_target(config, home):
     targets = _client_targets(config)
     assert set(targets) == {
-        "claude", "codex", "vscode", "cursor", "codex:codexb", "codex:codexc",
+        "claude", "antigravity", "codex", "vscode", "cursor",
+        "codex:codexb", "codex:codexc",
     }
 
 
@@ -77,6 +80,22 @@ def test_absent_clients_are_not_offered(config, tmp_path, monkeypatch):
 def test_one_file_covers_the_claude_app_cli_and_extension(config, home):
     """They read the same file; three entries would be three ways to drift."""
     assert _client_targets(config)["claude"]["path"] == home / ".claude.json"
+
+
+def test_antigravity_uses_its_global_mcp_profile(config, home):
+    assert _client_targets(config)["antigravity"]["path"] == (
+        home / ".gemini" / "config" / "mcp_config.json"
+    )
+
+
+def test_antigravity_detects_the_agy_executable(config, home, monkeypatch):
+    import bindery.cli as cli
+
+    (home / ".gemini" / "antigravity-cli").rmdir()
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda name: "/opt/homebrew/bin/agy" if name == "agy" else None
+    )
+    assert "antigravity" in _detect_clients()
 
 
 # -------------------------------------------------------------------- writing
@@ -127,6 +146,47 @@ def test_cursor_keeps_other_servers(config, home):
     assert set(written["mcpServers"]) == {"Figma", "bindery"}
 
 
+def test_antigravity_merges_into_its_profile_even_if_the_file_is_empty(config, home):
+    path = home / ".gemini" / "config" / "mcp_config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("", encoding="utf-8")
+
+    main(["install", "antigravity", "--write", "--vault", str(config.vault)])
+
+    written = json.loads(path.read_text(encoding="utf-8"))
+    entry = written["mcpServers"]["bindery"]
+    assert entry["command"]
+    assert entry["args"][-1] == "serve"
+    assert entry["env"]["BINDERY_VAULT"] == str(config.vault)
+    assert (path.with_suffix(".json.bak")).read_text(encoding="utf-8") == ""
+
+
+def test_antigravity_preserves_other_servers(config, home):
+    path = home / ".gemini" / "config" / "mcp_config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"mcpServers": {"context7": {"command": "npx", "args": ["ctx"]}}}),
+        encoding="utf-8",
+    )
+
+    main(["install", "antigravity", "--write", "--vault", str(config.vault)])
+
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert set(written["mcpServers"]) == {"context7", "bindery"}
+
+
+def test_antigravity_local_scope_uses_workspace_profile(config, home, monkeypatch):
+    project = home / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    main(["install", "antigravity", "--write", "--local", "--vault", str(config.vault)])
+
+    path = project / ".agents" / "mcp_config.json"
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert "bindery" in written["mcpServers"]
+
+
 def test_a_codex_account_home_is_written_as_toml(config, home):
     main(["install", "codex:codexb", "--write", "--vault", str(config.vault)])
 
@@ -141,6 +201,9 @@ def test_installing_everything_reaches_every_client(config, home):
     assert "bindery" in json.loads((home / ".claude.json").read_text(encoding="utf-8"))["mcpServers"]
     assert "bindery" in json.loads(_vscode(home).read_text(encoding="utf-8"))["servers"]
     assert "bindery" in json.loads((home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert "bindery" in json.loads(
+        (home / ".gemini" / "config" / "mcp_config.json").read_text(encoding="utf-8")
+    )["mcpServers"]
     for account in ("codexb", "codexc"):
         body = (home / ".codex-homes" / account / "config.toml").read_text(encoding="utf-8")
         assert "[mcp_servers.bindery]" in body
@@ -169,6 +232,54 @@ def test_the_index_boundary_reaches_every_client(config, home):
     assert vscode["servers"]["bindery"]["env"]["BINDERY_INCLUDE"] == "work"
     body = (home / ".codex-homes" / "codexb" / "config.toml").read_text(encoding="utf-8")
     assert 'BINDERY_INCLUDE = "work"' in body
+
+
+@pytest.mark.parametrize("client", ["claude", "codex", "antigravity"])
+def test_reinstall_inherits_each_boundary_until_its_cli_flag_is_set(config, home, client, monkeypatch):
+    spec = _client_targets(config)[client]
+    path = spec["path"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    args = ["--include", "legacy", "serve", "--include=work", "--include", "shared"]
+    env = {"BINDERY_INCLUDE": "ignored", "BINDERY_EXCLUDE": "private, drafts"}
+    if client == "codex":
+        path.write_text(
+            '[mcp_servers.bindery]\ncommand = "old-bindery"\n'
+            f'args = {json.dumps(args)}\n[mcp_servers.bindery.env]\n'
+            'BINDERY_INCLUDE = "ignored"\nBINDERY_EXCLUDE = "private, drafts"\n',
+            encoding="utf-8",
+        )
+    else:
+        path.write_text(json.dumps({"mcpServers": {"bindery": {
+            "command": "old-bindery", "args": args, "env": env,
+        }}}), encoding="utf-8")
+
+    def assert_boundaries(includes, excludes):
+        content = path.read_text(encoding="utf-8")
+        if client == "codex":
+            entry = tomllib.loads(content)["mcp_servers"]["bindery"]
+        else:
+            entry = json.loads(content)["mcpServers"]["bindery"]
+        assert entry["env"] == {
+            "BINDERY_VAULT": str(config.vault),
+            "BINDERY_INCLUDE": ",".join(includes),
+            "BINDERY_EXCLUDE": ",".join(excludes),
+        }
+        assert entry["args"][-2 * (len(includes) + len(excludes)) - 1:] == [
+            *[arg for prefix in includes for arg in ("--include", prefix)],
+            *[arg for prefix in excludes for arg in ("--exclude", prefix)],
+            "serve",
+        ]
+
+    monkeypatch.setenv("BINDERY_INCLUDE", "other")
+    monkeypatch.setenv("BINDERY_EXCLUDE", "other")
+    install = ["install", client, "--write", "--vault", str(config.vault)]
+    monkeypatch.setenv("BINDERY_STATE_DIR", str(config.state_dir))
+    assert main(install) == 0
+    assert_boundaries(["work", "shared"], ["private", "drafts"])
+    assert main(["--include", "new", *install]) == 0
+    assert_boundaries(["new"], ["private", "drafts"])
+    assert main([*install, "--exclude", "new-private"]) == 0
+    assert_boundaries(["new"], ["new-private"])
 
 
 # ---------------------------------------------------- installing selectively

@@ -17,11 +17,13 @@ class FakeTextEmbedding:
 
     supported: list[dict] = []
     constructed: list[str] = []
+    local_modes: list[bool] = []
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, *, local_files_only: bool = False):
         if model_name not in {m["model"] for m in self.supported}:
             raise ValueError(f"Model {model_name} is not supported in TextEmbedding.")
         FakeTextEmbedding.constructed.append(model_name)
+        FakeTextEmbedding.local_modes.append(local_files_only)
         self.model_name = model_name
 
     def embed(self, texts):
@@ -36,6 +38,7 @@ class FakeTextEmbedding:
 def reset():
     embed.reset_backend()
     FakeTextEmbedding.constructed = []
+    FakeTextEmbedding.local_modes = []
     yield
     embed.reset_backend()
 
@@ -97,3 +100,12 @@ def test_a_missing_backend_is_remembered_too(monkeypatch):
     monkeypatch.setitem(sys.modules, "sentence_transformers", None)
     assert embed.load_backend() is None
     assert embed.load_backend() is None
+
+
+def test_local_backend_only_uses_cached_model_files(monkeypatch):
+    _fake_fastembed(monkeypatch, [{"model": embed.MULTILINGUAL_MODELS[0], "dim": 384}])
+    local = embed.load_backend(local_files_only=True)
+    assert local is not None
+    assert embed.load_backend(local_files_only=True) is local
+    assert embed.load_backend() is not None
+    assert FakeTextEmbedding.local_modes == [True, False]

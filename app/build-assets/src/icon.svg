@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- macOS アイコングリッド: 824x824・角丸185 を中央に配置 -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#0B0B0D"/>
+
+  <!-- 3枚目（奥）の紙の縁 -->
+  <path
+    d="M 758 352 L 758 636 A 138 138 0 0 1 620 774 L 408 774"
+    fill="none"
+    stroke="#F5F5F7"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- 2枚目（中間）の紙の縁 -->
+  <path
+    d="M 704 296 L 704 636 A 84 84 0 0 1 620 720 L 352 720"
+    fill="none"
+    stroke="#F5F5F7"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- 1枚目（手前）の紙本体 -->
+  <rect x="296" y="240" width="368" height="440" rx="44" ry="44" fill="#F5F5F7"/>
+
+  <!-- 綴じ糸を通す背の切り欠き（黒抜き） -->
+  <rect x="276" y="324" width="104" height="56" rx="28" ry="28" fill="#0B0B0D"/>
+  <rect x="276" y="432" width="104" height="56" rx="28" ry="28" fill="#0B0B0D"/>
+  <rect x="276" y="540" width="104" height="56" rx="28" ry="28" fill="#0B0B0D"/>
+
+  <!-- 背を抱えて束ねる3本の綴じ糸 -->
+  <rect x="252" y="338" width="110" height="28" rx="14" ry="14" fill="#F5F5F7"/>
+  <rect x="252" y="446" width="110" height="28" rx="14" ry="14" fill="#F5F5F7"/>
+  <rect x="252" y="554" width="110" height="28" rx="14" ry="14" fill="#F5F5F7"/>
+</svg>

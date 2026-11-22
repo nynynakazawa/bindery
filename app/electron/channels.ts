@@ -1,0 +1,26 @@
+export const IPC_CHANNELS = {
+  getSnapshot: "app:get-snapshot",
+  syncNow: "app:sync-now",
+  openVault: "app:open-vault",
+  openLog: "app:open-log",
+  checkUv: "setup:check-uv",
+  installWheel: "setup:install-wheel",
+  selectVault: "setup:select-vault",
+  installClients: "setup:install-clients",
+  writeGlobalPrompt: "setup:write-global-prompt",
+  initSync: "setup:init-sync",
+  pairSync: "setup:pair-sync",
+  installScheduler: "setup:install-scheduler",
+  search: "notes:search",
+  listNotes: "notes:list",
+  readNote: "notes:read",
+  recent: "notes:recent",
+  ranking: "notes:ranking",
+  openInObsidian: "notes:open-in-obsidian",
+  revealInFinder: "notes:reveal-in-finder",
+  openExternal: "app:open-external",
+  setLoginItem: "app:set-login-item",
+  getLoginItem: "app:get-login-item",
+} as const;
+
+export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

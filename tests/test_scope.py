@@ -265,6 +265,9 @@ def test_the_boundary_is_written_into_the_agent_configuration(vault, tmp_path, m
     from bindery.cli import main
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    # Client detection should depend on the test directories.
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".codex").mkdir()
     _note(vault, "work/api.md", "body", project="")
 
     main([
@@ -289,6 +292,7 @@ def test_no_boundary_means_no_extra_environment(vault, tmp_path, monkeypatch):
     from bindery.cli import main
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    (tmp_path / ".claude").mkdir()
     _note(vault, "work/api.md", "body", project="")
 
     main(["install", "--write", "--vault", str(vault)])
