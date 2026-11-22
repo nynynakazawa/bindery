@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "bindery-mcp"
 version = "0.1.0"
-description = "One shared memory for Claude Code and Codex. Markdown stays the source of truth; retrieval is budgeted."
+description = "One shared memory for Claude Code, Codex, and Antigravity CLI. Markdown stays the source of truth; retrieval is budgeted."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-keywords = ["mcp", "memory", "claude-code", "codex", "obsidian", "rag"]
+keywords = ["mcp", "memory", "claude-code", "codex", "antigravity-cli", "obsidian", "rag"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",

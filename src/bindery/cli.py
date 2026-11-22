@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -20,19 +21,27 @@ from .config import Config
 from .episodes import set_baseline
 from .indexer import index_path, reindex
 from .search import search
-from .safeio import update_text
-from .store import Store
+from .safeio import ConcurrentUpdate, atomic_config_update, atomic_write, update_text
+from .store import SCHEMA_VERSION, Store
 from .workspace import MARKER as MARKER_HINT
 from .workspace import resolve as resolve_project
 
 
-def _add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--vault", help="Directory of Markdown notes (default: $BINDERY_VAULT).")
-    parser.add_argument("--state-dir", help="Where to keep the index.")
-    parser.add_argument("--no-semantic", action="store_true", help="Keyword search only.")
+class ConfigWriteError(RuntimeError):
+    """A requested configuration update could not be applied safely."""
+
+
+def _add_common(parser: argparse.ArgumentParser, *, suppress_defaults: bool = False) -> None:
+    absent = argparse.SUPPRESS if suppress_defaults else None
+    parser.add_argument("--vault", default=absent,
+                        help="Directory of Markdown notes (default: $BINDERY_VAULT).")
+    parser.add_argument("--state-dir", default=absent, help="Where to keep the index.")
+    parser.add_argument("--no-semantic", action="store_true", default=absent,
+                        help="Keyword search only.")
     parser.add_argument(
         "--include",
         action="append",
+        default=absent,
         metavar="DIR",
         help=(
             "Index ONLY this vault-relative directory. Repeatable. Naming any "
@@ -43,13 +52,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--exclude",
         action="append",
+        default=absent,
         metavar="DIR",
         help="Never index this vault-relative directory. Repeatable.",
     )
 
 
 
-def _add_project(parser: argparse.ArgumentParser) -> None:
+def _add_project(parser: argparse.ArgumentParser, *, suppress_defaults: bool = False) -> None:
     """Name the codebase whose memory this command is about.
 
     Every subcommand takes it, and it means the same thing in all of them. It
@@ -59,6 +69,7 @@ def _add_project(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument(
         "--project",
+        default=argparse.SUPPRESS if suppress_defaults else None,
         help=(
             "Name the codebase these notes belong to (default: detected from the "
             "git remote of the working directory). Pass '' to disable scoping."
@@ -158,22 +169,71 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_status_db(config: Config) -> dict | None:
+    """Read index health without opening Store or changing the database."""
+    path = config.db_path
+    if not path.is_file():
+        return None
+    try:
+        with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "meta" not in tables:
+                return {"stats": {"notes": 0, "chunks": 0, "links": 0, "vectors": 0},
+                        "migration": True, "rebuild": False}
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            migration = row is None or str(row[0]) != str(SCHEMA_VERSION)
+            stats: dict[str, int] = {}
+            for table in ("notes", "chunks", "links", "vectors"):
+                stats[table] = (
+                    int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                    if table in tables else 0
+                )
+            rebuild_row = conn.execute(
+                "SELECT value FROM meta WHERE key='rebuild_required'"
+            ).fetchone()
+            rebuild = bool(rebuild_row and str(rebuild_row[0]) == "1")
+            return {"stats": stats, "migration": migration, "rebuild": rebuild}
+    except (OSError, sqlite3.DatabaseError):
+        return {"stats": {"notes": 0, "chunks": 0, "links": 0, "vectors": 0},
+                "migration": True, "rebuild": False, "unreadable": True}
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from .embed import load_backend
 
     config = _config_from(args)
-    store = Store(config.db_path)
-    stats = store.stats()
-    backend = load_backend() if config.semantic else None
+    explicitly_configured = bool(
+        getattr(args, "vault", None) or os.environ.get("BINDERY_VAULT", "").strip()
+    )
+    db_info = _read_status_db(config) if explicitly_configured else None
+    stats = (db_info or {"stats": {"notes": 0, "chunks": 0, "links": 0, "vectors": 0}})["stats"]
+    backend = (
+        load_backend()
+        if db_info and config.vault.exists() and not db_info.get("migration") and config.semantic
+        else None
+    )
 
     problems: list[str] = []
-    if not config.vault.exists():
+    if not explicitly_configured:
+        problems.append("vault is not specified; index is not initialized (未索引)")
+    elif not config.vault.exists():
         problems.append(f"vault does not exist: {config.vault}")
-    elif stats["notes"] == 0 and store.rebuild_required:
-        problems.append("an upgrade reset the index - run: bindery index")
+    elif db_info is None:
+        problems.append(f"vault is not indexed (未索引): {config.vault}")
+    elif db_info.get("unreadable"):
+        problems.append(f"index cannot be read without changing it: {config.db_path}")
+    elif db_info.get("migration") or db_info.get("rebuild"):
+        problems.append("index needs migration or rebuild; run: bindery index")
     elif stats["notes"] == 0:
         problems.append(f"vault has no indexed Markdown notes: {config.vault}")
-    if config.semantic and backend is None:
+    if config.semantic and db_info and not db_info.get("migration") and backend is None:
         problems.append("semantic search requested but no backend installed "
                         "(uv tool install --force 'bindery-mcp[semantic]') - keyword search still works")
     if backend is not None and stats["vectors"] < stats["chunks"]:
@@ -193,14 +253,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  project        {resolve(state_dir=config.state_dir).describe()}")
     print(f"  semantic       {backend.name if backend else 'off (keyword only)'}")
     if backend:
-        print(f"  vector index   {'sqlite-vec' if store.ann_enabled else 'exact scan'}")
+        print("  vector index   read-only status")
     if problems:
         print("\nissues:")
         for problem in problems:
             print(f"  ! {problem}")
     else:
         print("\nready")
-    store.close()
     return 1 if problems else 0
 
 
@@ -342,15 +401,18 @@ def _server_command() -> tuple[str, list[str]]:
 def _client_targets(config: Config, scope: str = "user") -> dict[str, dict]:
     """Config payloads for every supported client, keyed by client id.
 
-    Scope matters and the two agents express it differently. Codex keeps MCP
-    servers in one global ``config.toml``; Claude Code has both a per-project
-    ``.mcp.json`` and a user-level entry in ``~/.claude.json``. Defaulting
-    Claude Code to project scope would quietly make the memory work in one
-    checkout and be missing everywhere else, while Codex saw it everywhere -
-    so user scope is the default for both, and project scope is opt-in.
+    Scope matters and clients express it differently. Codex keeps MCP servers
+    in one global ``config.toml``; Claude Code and Antigravity have both
+    project and user scopes. User scope is the default so the memory works
+    across projects, and project scope is opt-in where the client supports it.
     """
     command, extra = _server_command()
-    args = [*extra, "serve"]
+    args = [*extra, "--vault", str(config.vault), "--project", config.project]
+    for prefix in config.include:
+        args.extend(("--include", prefix))
+    for prefix in config.exclude:
+        args.extend(("--exclude", prefix))
+    args.append("serve")
     env = {"BINDERY_VAULT": str(config.vault)}
     # The boundary has to travel with the configuration. `install --include`
     # would otherwise apply only to the index built right then: the server the
@@ -363,12 +425,25 @@ def _client_targets(config: Config, scope: str = "user") -> dict[str, dict]:
     claude_path = (
         Path.cwd() / ".mcp.json" if scope == "project" else Path.home() / ".claude.json"
     )
-    base = {"command": command, "args": args, "env": env}
+    antigravity_path = (
+        Path.cwd() / ".agents" / "mcp_config.json"
+        if scope == "project"
+        else Path.home() / ".gemini" / "config" / "mcp_config.json"
+    )
+    base = {"command": command, "args": args, "env": env, "lock_dir": config.state_dir}
     targets: dict[str, dict] = {
         "claude": {
             "label": "Claude Code (app, CLI, and VS Code extension)",
             # All three read this same file, so one entry covers them.
             "path": claude_path,
+            "scope": scope,
+            "format": "mcpServers",
+            **base,
+        },
+        "antigravity": {
+            "label": "Antigravity CLI",
+            # Antigravity keeps MCP servers in a standalone JSON profile.
+            "path": antigravity_path,
             "scope": scope,
             "format": "mcpServers",
             **base,
@@ -441,6 +516,8 @@ def _detect_clients() -> set[str]:
     found: set[str] = set()
     if shutil.which("claude") or (Path.home() / ".claude").exists():
         found.add("claude")
+    if shutil.which("agy") or (Path.home() / ".gemini" / "antigravity-cli").exists():
+        found.add("antigravity")
     if shutil.which("codex") or (Path.home() / ".codex").exists():
         found.add("codex")
     if _vscode_mcp_path().parent.is_dir():
@@ -474,15 +551,20 @@ def _render_claude(spec: dict) -> str:
 
 
 def _render_codex(spec: dict) -> str:
-    arg_list = ", ".join(f'"{a}"' for a in spec["args"])
+    def toml_string(value: str) -> str:
+        # TOML basic strings use the same escapes as JSON for the characters
+        # that can occur in paths and command arguments.
+        return json.dumps(str(value), ensure_ascii=False)
+
+    arg_list = ", ".join(toml_string(a) for a in spec["args"])
     lines = [
         "[mcp_servers.bindery]",
-        f'command = "{spec["command"]}"',
+        f"command = {toml_string(spec['command'])}",
         f"args = [{arg_list}]",
         "",
         "[mcp_servers.bindery.env]",
     ]
-    lines += [f'{key} = "{value}"' for key, value in spec["env"].items()]
+    lines += [f"{key} = {toml_string(value)}" for key, value in spec["env"].items()]
     return "\n".join(lines)
 
 
@@ -496,23 +578,32 @@ def _write_json(spec: dict) -> str:
     VS Code's and Cursor's files, which hold other people's servers.
     """
     path: Path = spec["path"]
-    existing: dict = {}
-    if path.exists():
-        raw = path.read_text(encoding="utf-8")
-        try:
-            existing = json.loads(raw)
-        except ValueError:
-            return f"! {path} is not valid JSON - left untouched."
-        if not isinstance(existing, dict):
-            return f"! {path} is not a JSON object - left untouched."
-        path.with_suffix(path.suffix + ".bak").write_text(raw, encoding="utf-8")
-    servers = existing.setdefault(spec["format"], {})
-    if not isinstance(servers, dict):
-        return f"! {path} has a non-object {spec['format']!r} - left untouched."
-    replaced = "bindery" in servers
-    servers["bindery"] = _entry_for(spec)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    replaced = False
+
+    def transform(raw: str) -> str:
+        nonlocal replaced
+        existing: dict = {}
+        if raw.strip():
+            try:
+                existing = json.loads(raw)
+            except ValueError as exc:
+                raise ConfigWriteError(f"{path} is not valid JSON - left untouched.") from exc
+            if not isinstance(existing, dict):
+                raise ConfigWriteError(f"{path} is not a JSON object - left untouched.")
+        servers = existing.setdefault(spec["format"], {})
+        if not isinstance(servers, dict):
+            raise ConfigWriteError(
+                f"{path} has a non-object {spec['format']!r} - left untouched."
+            )
+        replaced = "bindery" in servers
+        servers["bindery"] = _entry_for(spec)
+        return json.dumps(existing, ensure_ascii=False, indent=2) + "\n"
+
+    atomic_config_update(
+        path,
+        transform,
+        lock_dir=spec["lock_dir"],
+    )
     verb = "updated" if replaced else "wrote"
     return f"{verb} {path} ({spec['scope']} scope)"
 
@@ -574,15 +665,16 @@ def _write_codex(spec: dict) -> str:
     replace it; anything else in the file is copied through untouched.
     """
     path: Path = spec["path"]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    current = path.read_text(encoding="utf-8") if path.exists() else ""
-    if current:
-        backup = path.with_suffix(path.suffix + ".bak")
-        backup.write_text(current, encoding="utf-8")
-    remainder, replaced = _drop_codex_block(current)
-    remainder = remainder.rstrip("\n")
-    separator = "\n\n" if remainder else ""
-    path.write_text(remainder + separator + _render_codex(spec) + "\n", encoding="utf-8")
+    replaced = False
+
+    def transform(current: str) -> str:
+        nonlocal replaced
+        remainder, replaced = _drop_codex_block(current)
+        remainder = remainder.rstrip("\n")
+        separator = "\n\n" if remainder else ""
+        return remainder + separator + _render_codex(spec) + "\n"
+
+    atomic_config_update(path, transform, lock_dir=spec["lock_dir"])
     return f"updated {path}" if replaced else f"wrote {path}"
 
 
@@ -594,7 +686,11 @@ def _write_codex(spec: dict) -> str:
 #: of them, and an agent that was never told to record anything records nothing.
 PROMPT_TARGETS = {
     "project": [Path("AGENTS.md"), Path("CLAUDE.md")],
-    "user": [Path(".codex") / "AGENTS.md", Path(".claude") / "CLAUDE.md"],
+    "user": [
+        Path(".codex") / "AGENTS.md",
+        Path(".claude") / "CLAUDE.md",
+        Path(".gemini") / "GEMINI.md",
+    ],
 }
 
 
@@ -651,22 +747,37 @@ def cmd_prompt(args: argparse.Namespace) -> int:
 
     scope = "user" if args.user else "project"
     root = Path.home() if args.user else Path.cwd()
+    lock_dir = Config.resolve().state_dir
     written: list[str] = []
+    failed = False
     for relative in PROMPT_TARGETS[scope]:
         target = root / relative
         if not target.parent.exists():
-            print(f"- {target}: parent directory missing - skipped.")
+            if (
+                scope == "user"
+                and relative == Path(".gemini") / "GEMINI.md"
+                and "antigravity" in _detect_clients()
+            ):
+                target.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                print(f"- {target}: parent directory missing - skipped.")
+                continue
+        action = "unchanged"
+
+        def transform(current: str) -> str:
+            nonlocal action
+            updated, action = _apply_instructions(current)
+            return updated
+
+        try:
+            atomic_config_update(target, transform, lock_dir=lock_dir)
+        except (ConcurrentUpdate, ConfigWriteError, OSError, UnicodeError) as exc:
+            print(f"- {target}: failed ({exc})", file=sys.stderr)
+            failed = True
             continue
-        current = target.read_text(encoding="utf-8") if target.exists() else ""
-        updated, action = _apply_instructions(current)
         if action == "unchanged":
             print(f"- {target}: already up to date.")
             continue
-        if current:
-            # These files often hold a lot of hand-written policy. Never edit
-            # one without leaving the previous version recoverable.
-            target.with_suffix(target.suffix + ".bak").write_text(current, encoding="utf-8")
-        target.write_text(updated, encoding="utf-8")
         written.append(f"{target} ({action})")
 
     if written:
@@ -675,7 +786,7 @@ def cmd_prompt(args: argparse.Namespace) -> int:
             print(f"  {path}")
     else:
         print("nothing written.")
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_project(args: argparse.Namespace) -> int:
@@ -725,7 +836,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         print(f"{args.name} -> {target}")
         if args.marker:
             marker = target / MARKER
-            marker.write_text(args.name + "\n", encoding="utf-8")
+            atomic_write(marker, args.name + "\n")
             print(f"wrote {marker}")
         return 0
 
@@ -749,9 +860,8 @@ def cmd_project(args: argparse.Namespace) -> int:
 def cmd_install(args: argparse.Namespace) -> int:
     """Print - or apply - client configuration.
 
-    Both agents are first-class here. With no client named, every supported
-    client is emitted, so nothing about the setup implies one of them is the
-    primary and the other an afterthought.
+    With no client named, every supported client is emitted, so no one client
+    is treated as the primary one.
     """
     config = _config_from(args)
     scope = "project" if getattr(args, "local", False) else "user"
@@ -761,6 +871,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         return 2
     chosen = [args.client] if args.client else sorted(targets)
     detected = _detect_clients()
+    failed = False
 
     for index, client in enumerate(chosen):
         spec = targets[client]
@@ -777,7 +888,14 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(_render_target(spec))
         if args.write:
             print()
-            print(_write_target(spec))
+            try:
+                message = _write_target(spec)
+                print(message)
+                if isinstance(message, str) and message.startswith("!"):
+                    failed = True
+            except (ConfigWriteError, ConcurrentUpdate, OSError, UnicodeError) as exc:
+                print(f"! failed to update {spec['path']}: {exc}", file=sys.stderr)
+                failed = True
 
     print()
     print("# Point every client at the SAME BINDERY_VAULT - that is what shares the memory.")
@@ -789,7 +907,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     print("#")
     print("# Or do the whole thing at once:")
     print("#   bindery setup --write")
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -843,6 +961,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print(f"\n[4/{steps}] MCP server configuration")
     targets = _client_targets(config, "project" if args.local else "user")
     detected = _detect_clients()
+    config_failed = False
     for client in sorted(targets):
         spec = targets[client]
         if client not in detected:
@@ -852,13 +971,21 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print(f"  {spec['label']}: not installed - skipped")
             continue
         if args.write:
-            print(f"  {spec['label']}: {_write_target(spec)}")
+            try:
+                message = _write_target(spec)
+                print(f"  {spec['label']}: {message}")
+                if isinstance(message, str) and message.startswith("!"):
+                    config_failed = True
+            except (ConfigWriteError, ConcurrentUpdate, OSError, UnicodeError) as exc:
+                print(f"  {spec['label']}: failed ({exc})", file=sys.stderr)
+                config_failed = True
         else:
             print(f"  {spec['label']}: would write {spec['path']} [{spec['scope']} scope]")
 
     print(f"\n[5/{steps}] agent instructions (this is the step that makes anything get recorded)")
+    prompt_status = 0
     if args.write:
-        cmd_prompt(argparse.Namespace(write=True, user=True))
+        prompt_status = cmd_prompt(argparse.Namespace(write=True, user=True))
     else:
         for relative in PROMPT_TARGETS["user"]:
             target = Path.home() / relative
@@ -873,7 +1000,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if store is not None:
         store.close()
     print("\nRestart your agents so they pick up the new configuration.")
-    return 0 if ok else 1
+    return 0 if ok and not config_failed and prompt_status == 0 else 1
 
 
 def _prepare_semantic(config: Config) -> None:
@@ -965,28 +1092,33 @@ def _health_check(config: Config, store: Store | None) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bindery",
-        description="One shared memory for Claude Code and Codex.",
+        description="One shared memory for Claude Code, Codex, and Antigravity CLI.",
     )
     parser.add_argument("--version", action="version", version=f"bindery {__version__}")
+    # Server command lines generated for clients place the resolved boundary
+    # before the subcommand. Keep the same options available after the
+    # subcommand for the documented CLI form as well.
+    _add_common(parser)
+    _add_project(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_serve = sub.add_parser("serve", help="Run the MCP server on stdio (what agents launch).")
-    _add_common(p_serve)
-    _add_project(p_serve)
+    _add_common(p_serve, suppress_defaults=True)
+    _add_project(p_serve, suppress_defaults=True)
     p_serve.add_argument("--max-tokens", type=int, help="Default response budget.")
     p_serve.add_argument("--limit", type=int, help="Default passages per search.")
     p_serve.set_defaults(func=cmd_serve)
 
     p_index = sub.add_parser("index", help="Scan the vault and refresh the index.")
-    _add_common(p_index)
-    _add_project(p_index)
+    _add_common(p_index, suppress_defaults=True)
+    _add_project(p_index, suppress_defaults=True)
     p_index.add_argument("--force", action="store_true", help="Reindex every note.")
     p_index.add_argument("--embed", action="store_true", help="Also compute missing embeddings.")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search from the terminal.")
-    _add_common(p_search)
-    _add_project(p_search)
+    _add_common(p_search, suppress_defaults=True)
+    _add_project(p_search, suppress_defaults=True)
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int)
     p_search.add_argument("--max-tokens", type=int)
@@ -994,21 +1126,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.set_defaults(func=cmd_search)
 
     p_status = sub.add_parser("status", help="Show index health. Exits non-zero on problems.")
-    _add_common(p_status)
-    _add_project(p_status)
+    _add_common(p_status, suppress_defaults=True)
+    _add_project(p_status, suppress_defaults=True)
     p_status.set_defaults(func=cmd_status)
 
     p_review = sub.add_parser("review", help="Show how the memory is growing and what needs attention.")
-    _add_common(p_review)
-    _add_project(p_review)
+    _add_common(p_review, suppress_defaults=True)
+    _add_project(p_review, suppress_defaults=True)
     p_review.add_argument("--min-count", type=int, default=2,
                           help="Minimum repeats before an unanswered query counts as a gap.")
     p_review.add_argument("--json", action="store_true")
     p_review.set_defaults(func=cmd_review)
 
     p_install = sub.add_parser("install", help="Print (or apply) configuration for every agent.")
-    _add_common(p_install)
-    _add_project(p_install)
+    _add_common(p_install, suppress_defaults=True)
+    _add_project(p_install, suppress_defaults=True)
     # Not a fixed `choices` list: the Codex account entries are discovered at
     # runtime, so the valid names depend on the machine.
     p_install.add_argument("client", nargs="?",
@@ -1016,25 +1148,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--write", action="store_true",
                            help="Apply the configuration instead of printing it. Backs up first.")
     p_install.add_argument("--local", action="store_true",
-                           help="Configure Claude Code for this directory only (./.mcp.json) "
-                                "instead of every project. Codex has no project scope and is "
-                                "unaffected.")
+                           help="Configure clients with project scope where supported "
+                                "(Claude Code: ./.mcp.json; Antigravity: "
+                                "./.agents/mcp_config.json). Codex remains global.")
     p_install.set_defaults(func=cmd_install)
 
     p_setup = sub.add_parser("setup", help="Index, configure every agent, and install the instructions.")
-    _add_common(p_setup)
-    _add_project(p_setup)
+    _add_common(p_setup, suppress_defaults=True)
+    _add_project(p_setup, suppress_defaults=True)
     p_setup.add_argument("--write", action="store_true",
                          help="Apply the changes. Without this, setup only reports what it would do.")
     p_setup.add_argument("--local", action="store_true",
-                         help="Configure Claude Code for this directory only (./.mcp.json) "
-                              "instead of globally.")
+                         help="Configure clients with project scope where supported "
+                              "(Claude Code and Antigravity) instead of globally.")
     p_setup.set_defaults(func=cmd_setup)
 
     p_project = sub.add_parser(
         "project", help="Show or set which directories belong to which project."
     )
-    _add_common(p_project)
+    _add_common(p_project, suppress_defaults=True)
     p_project.add_argument(
         "action", nargs="?", choices=["list", "which", "add", "remove"], default="list",
         help="list (default), which PATH, add NAME [PATH], remove NAME",
@@ -1051,8 +1183,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_prompt.add_argument("--write", action="store_true",
                           help="Append to the agent instruction files instead of printing.")
     p_prompt.add_argument("--user", "--global", dest="user", action="store_true",
-                          help="Write to ~/.codex/AGENTS.md and ~/.claude/CLAUDE.md so the "
-                               "instructions apply in every project, not just this one.")
+                          help="Write to the user-level agent instruction files, including "
+                               "~/.gemini/GEMINI.md when ~/.gemini exists.")
     p_prompt.set_defaults(func=cmd_prompt)
 
     return parser

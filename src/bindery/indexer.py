@@ -348,14 +348,29 @@ def digest_of(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
+def _inside_vault(path: Path, vault: Path) -> Path | None:
+    """Return the real path only when it remains inside the real vault."""
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(vault.resolve())
+    except ValueError:
+        return None
+    return resolved
+
+
 def iter_markdown(config: Config):
+    seen: set[Path] = set()
     for path in sorted(config.vault.rglob("*.md")):
         if any(part in SKIP_DIRS for part in path.parts):
             continue
-        rel = str(path.relative_to(config.vault))
+        real_path = _inside_vault(path, config.vault)
+        if real_path is None or real_path in seen:
+            continue
+        seen.add(real_path)
+        rel = str(real_path.relative_to(config.vault.resolve()))
         if not is_indexable(rel, include=config.include, exclude=config.exclude):
             continue
-        yield path
+        yield real_path
 
 
 @dataclass(slots=True)
@@ -454,8 +469,11 @@ def index_path(config: Config, store: Store, path: Path, *, force: bool = False)
     the lesson was worth.
     """
     report = IndexReport()
+    path = _inside_vault(path, config.vault)
+    if path is None:
+        return report
     try:
-        rel = str(path.relative_to(config.vault))
+        rel = str(path.relative_to(config.vault.resolve()))
     except ValueError:
         return report
     if not is_indexable(rel, include=config.include, exclude=config.exclude):

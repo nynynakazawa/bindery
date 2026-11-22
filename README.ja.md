@@ -1,13 +1,13 @@
 # Bindery
 
-**Claude Code と Codex で、ひとつの記憶を共有する。**
+**Claude Code、Codex、Antigravity CLI で、ひとつの記憶を共有する。**
 
 [English README](README.md)
 
 Bindery は、コーディングエージェントに永続的な共有知識ベースを与える
 [MCP](https://modelcontextprotocol.io) サーバーです。しかも**いま作業している
-プロジェクトにスコープされます**。Claude Code が書き残した判断を、次のセッションの
-Codex が見つけられます。エージェントが実際に読んだノートは上位に、読まれなくなった
+プロジェクトにスコープされます**。あるクライアントが書き残した判断を、別の
+クライアントから見つけられます。エージェントが実際に読んだノートは上位に、読まれなくなった
 ノートは静かに沈むので、使うほど精度が上がります。ノートはディスク上の素の
 Markdown のままなので、Obsidian も `grep` も `git` もそのまま使えます。
 
@@ -42,8 +42,8 @@ Bindery はこの3つに、ひとつの考え方で答えます。
 
 ## できること
 
-- **エージェント間で共有される。** 両クライアントが同じ Vault を指せば、
-  同じインデックスを見ます。片方が書いたノートは、もう片方からすぐ検索できます。
+- **エージェント間で共有される。** 接続したクライアントが同じ Vault を指せば、
+  同じインデックスを見ます。あるクライアントが書いたノートは、ほかからすぐ検索できます。
 - **ファイル単位ではなく箇所単位で返す。** ノートは Markdown の見出しで分割され、
   ヒットした節だけが返ります。文書全体は返りません。
 - **トークン上限が効く。** 検索応答には必ず上限（既定 2,000 トークン）がかかります。
@@ -250,17 +250,17 @@ bindery project which ~/work/Product/Sales    # なぜそう判定されたか
 
 ## エージェントに繋ぐ
 
-**どちらのエージェントも主ではありません。** 引数なしの `install` は対応する
+**特定のクライアントに限定されません。** 引数なしの `install` は対応する
 全クライアントの設定を出力し、どれが検出できたかも表示します。
 
 ```bash
 bindery install              # 全クライアント分を表示
 bindery install --write      # 実際に書き込む（先にバックアップを取り、
                                   # 既存の他サーバー設定は壊しません）
-bindery install codex        # 片方だけにすることも可能
+bindery install antigravity # Antigravity CLI だけにすることも可能
 ```
 
-出力される2形式:
+出力例:
 
 ```jsonc
 // Claude Code - .mcp.json
@@ -279,6 +279,29 @@ args = ["serve"]
 BINDERY_VAULT = "/Users/you/Obsidian/MyVault"
 ```
 
+```jsonc
+// Antigravity CLI - ~/.gemini/config/mcp_config.json
+{ "mcpServers": { "bindery": {
+    "command": "bindery", "args": ["serve"],
+    "env": { "BINDERY_VAULT": "/Users/you/Obsidian/MyVault" } } } }
+```
+
+`--local` を付けると、Antigravity CLI はプロジェクト内の
+`.agents/mcp_config.json` に登録されます。
+
+Antigravity CLI 用の設定には、Vault と環境変数で指定する索引境界をサーバーの引数と
+環境変数の両方に書き込みます。プロジェクトの範囲も `--project` 引数で渡すため、
+クライアントが環境変数をそのまま渡さない場合でも、`--include`、`--exclude`、プロジェクトの
+範囲を保てます。登録内容は次で確認できます。
+
+```bash
+agy mcp list
+```
+
+設定先は agy 1.4.2 と agy 1.5.13 で確認しました。プロジェクト単位では、
+Antigravity CLI も既存の `AGENTS.md` を読むため、`bindery prompt --write` が書く
+プロジェクト用の指示ブロックが適用されます。
+
 **すべてのクライアントで `BINDERY_VAULT` を同じ値にしてください。**
 インデックスの場所はこの値から導出されるため、ここが揃っていることが
 「記憶が共有される」ことの条件そのものです。
@@ -292,7 +315,7 @@ MCP サーバーは呼ばれたら答えることしかできません。**エ�
 しない限り何も残りません。その判断を作るのがこの指示文です。
 
 ```bash
-bindery prompt --global --write   # ~/.claude/CLAUDE.md と ~/.codex/AGENTS.md
+bindery prompt --global --write   # ~/.gemini があれば ~/.gemini/GEMINI.md も書く
 bindery prompt --write            # このプロジェクトの CLAUDE.md / AGENTS.md のみ
 bindery prompt                    # 表示だけして好きな場所に貼る
 ```
@@ -416,6 +439,7 @@ bindery prompt [--write] [--global]
 | Claude Code — アプリ / CLI / VS Code 拡張 | `~/.claude.json` |
 | Codex — CLI / IDE拡張 / アプリ | `~/.codex/config.toml` |
 | Codex のアカウント別ホーム（`codex-multi`） | `~/.codex-homes/<アカウント>/config.toml` |
+| Antigravity CLI | `~/.gemini/config/mcp_config.json`（プロジェクト単位なら `.agents/mcp_config.json`） |
 | VS Code（Copilot エージェントモード） | `~/Library/Application Support/Code/User/mcp.json` |
 | Cursor | `~/.cursor/mcp.json` |
 

@@ -265,6 +265,9 @@ def test_the_boundary_is_written_into_the_agent_configuration(vault, tmp_path, m
     from bindery.cli import main
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    # The installer only writes clients it detects; provide a fake Codex home
+    # because the test runs independently of the user's installed clients.
+    (tmp_path / ".codex").mkdir()
     _note(vault, "work/api.md", "body", project="")
 
     main([

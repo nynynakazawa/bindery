@@ -1,13 +1,13 @@
 # Bindery
 
-**One shared memory for Claude Code and Codex.**
+**One shared memory for Claude Code, Codex, and Antigravity CLI.**
 
 [日本語版 README](README.ja.md)
 
 Bindery is an [MCP](https://modelcontextprotocol.io) server that gives your
 coding agents a single, persistent knowledge base, **scoped to the project
-you are in**. Claude Code writes a decision down; Codex finds it in the next
-session. Notes that agents actually read get ranked higher and ones that stop
+you are in**. A decision written by one client can be found by another.
+Notes that agents actually read get ranked higher and ones that stop
 being read fade, so the memory sharpens with use. Your notes stay as plain
 Markdown on disk, so Obsidian, `grep`, and `git` all keep working.
 
@@ -25,9 +25,9 @@ re-explanation is pure token cost, paid again on every new terminal.
 loading it is slow, and loading *part* of it means guessing which part. Past a
 certain size the agent either runs out of context or reads the wrong files.
 
-**Two agents means two memories.** Claude Code and Codex each have their own
-native memory (`CLAUDE.md`, `AGENTS.md`, Codex Memories). None of it crosses
-over. Work done in one is invisible to the other.
+**Every agent keeps its own memory.** Claude Code and Codex each have native
+memory files (`CLAUDE.md`, `AGENTS.md`, Codex Memories), but those do not cross
+over. Work done in one is invisible to another unless they share a knowledge base.
 
 **A memory that only stores is a filing cabinet.** Notes pile up, nothing is ever
 consolidated, and nobody can tell which ones are earning their keep or what the
@@ -35,7 +35,7 @@ collection is missing.
 
 Bindery answers all three with one idea: **keep the Markdown, replace the
 loading.** Notes stay files. Retrieval becomes a search that returns matching
-passages under a hard token budget, from an index both agents share.
+passages under a hard token budget, from an index all connected agents share.
 
 ---
 
@@ -254,17 +254,17 @@ the instruction block pasted somewhere of your choosing. Otherwise skip to
 
 ## Connect your agents
 
-Neither agent is the primary one. `install` with no argument emits the
+No single client is the primary one. `install` with no argument emits the
 configuration for every supported client and tells you which it can see:
 
 ```bash
 bindery install              # print config for all clients
 bindery install --write      # apply it (backs up first, never clobbers
                                   # servers you already configured)
-bindery install codex        # or just one
+bindery install antigravity # or just Antigravity CLI
 ```
 
-For reference, the two forms it produces:
+For reference, here are examples of the forms it produces:
 
 ```jsonc
 // Claude Code - .mcp.json
@@ -283,6 +283,29 @@ args = ["serve"]
 BINDERY_VAULT = "/Users/you/Obsidian/MyVault"
 ```
 
+```jsonc
+// Antigravity CLI - ~/.gemini/config/mcp_config.json
+{ "mcpServers": { "bindery": {
+    "command": "bindery", "args": ["serve"],
+    "env": { "BINDERY_VAULT": "/Users/you/Obsidian/MyVault" } } } }
+```
+
+With `--local`, Antigravity CLI uses `.agents/mcp_config.json` in the project.
+
+For Antigravity CLI, `install` writes the Vault and environment-backed index
+boundaries into both the server arguments and its environment. It also writes
+the project scope as an explicit `--project` argument, so `--include`,
+`--exclude`, and project scope remain in force even when the client does not
+pass the environment through unchanged. Confirm the registration with:
+
+```bash
+agy mcp list
+```
+
+The configuration paths above were checked with agy 1.4.2 and agy 1.5.13.
+At project scope, Antigravity also reads the existing `AGENTS.md`, so the
+project instruction block written by `bindery prompt --write` applies there.
+
 **Point every client at the same `BINDERY_VAULT`.** That single shared value
 is what makes the memory shared - the index location is derived from it.
 
@@ -295,7 +318,7 @@ so nothing is written unless the agent decides to write it. These instructions
 are that decision:
 
 ```bash
-bindery prompt --global --write   # ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md
+bindery prompt --global --write   # also writes ~/.gemini/GEMINI.md when ~/.gemini exists
 bindery prompt --write            # or just this project's CLAUDE.md / AGENTS.md
 bindery prompt                    # or print, and paste where you like
 ```
@@ -423,6 +446,7 @@ turned into clutter.
 | Claude Code — app, CLI, and VS Code extension | `~/.claude.json` |
 | Codex — CLI, IDE extension, app | `~/.codex/config.toml` |
 | Codex, per-account (`codex-multi`) | `~/.codex-homes/<account>/config.toml` |
+| Antigravity CLI | `~/.gemini/config/mcp_config.json` (or `.agents/mcp_config.json` per project) |
 | VS Code, Copilot agent mode | `~/Library/Application Support/Code/User/mcp.json` |
 | Cursor | `~/.cursor/mcp.json` |
 
@@ -475,7 +499,7 @@ living on different scales.
 nothing to rescan. The server also rescans on startup, so edits made in Obsidian
 while no agent was running are picked up automatically.
 
-**Concurrency.** SQLite in WAL mode with a busy timeout, so both agents can hold
+**Concurrency.** SQLite in WAL mode with a busy timeout, so connected agents can hold
 the index open at once.
 
 ### The growth loop

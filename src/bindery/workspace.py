@@ -33,6 +33,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .safeio import atomic_write
+
 #: Dropped in a directory to name the project it and everything under it
 #: belongs to. An empty file means "use this directory's name", which is
 #: enough to stop a subdirectory from claiming its own identity.
@@ -85,9 +87,9 @@ def save_registry(state_dir: Path, entries: list[dict]) -> None:
     path = registry_path(state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(entries, key=lambda e: str(e["path"]))
-    path.write_text(
+    atomic_write(
+        path,
         json.dumps({"projects": ordered}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
     )
 
 

@@ -66,6 +66,10 @@ class LockTimeout(RuntimeError):
     """Another process held the lock for longer than the caller would wait."""
 
 
+class ConcurrentUpdate(RuntimeError):
+    """A file changed while a read-modify-write operation was in progress."""
+
+
 def lock_file_for(target: Path, lock_dir: Path) -> Path:
     """Where the lock for ``target`` lives.
 
@@ -158,6 +162,69 @@ def atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:
         tmp.unlink(missing_ok=True)
         raise
     _fsync_dir(directory)
+
+
+def _file_snapshot(path: Path) -> tuple[bool, str, str]:
+    """Return existence, text, and a digest for one configuration file."""
+    if not path.exists():
+        return False, "", ""
+    raw = path.read_bytes()
+    return True, raw.decode("utf-8"), hashlib.sha256(raw).hexdigest()
+
+
+def _backup_path(path: Path) -> Path:
+    """Choose a backup name without replacing an earlier backup."""
+    plain = path.with_suffix(path.suffix + ".bak")
+    if not plain.exists():
+        return plain
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime())
+    candidate = path.with_name(f"{path.name}.bak.{stamp}.{time.time_ns() % 1_000_000:06d}")
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(
+            f"{path.name}.bak.{stamp}.{time.time_ns() % 1_000_000:06d}.{counter}"
+        )
+        counter += 1
+    return candidate
+
+
+def _backup_text(path: Path, text: str) -> Path:
+    """Back up a UTF-8 configuration file using a recoverable unique name."""
+    backup = _backup_path(path)
+    atomic_write(backup, text)
+    return backup
+
+
+def atomic_config_update(
+    path: Path,
+    transform: Callable[[str], str],
+    *,
+    lock_dir: Path,
+    backup: bool = True,
+    timeout: float = LOCK_TIMEOUT,
+) -> str:
+    """Safely apply a read-modify-write transformation to a config file.
+
+    The lock coordinates Bindery writers. The digest check also detects an
+    external writer that does not use Bindery's lock. Such a race is retried
+    once with fresh input; a second race leaves the file untouched and fails.
+    """
+    for attempt in range(2):
+        with file_lock(path, lock_dir, timeout):
+            existed, current, digest = _file_snapshot(path)
+            updated = transform(current)
+            now_existed, _now, now_digest = _file_snapshot(path)
+            if (existed, digest) != (now_existed, now_digest):
+                if attempt == 0:
+                    continue
+                raise ConcurrentUpdate(f"{path} changed during update")
+            if updated == current:
+                return updated
+            if existed and backup:
+                _backup_text(path, current)
+            atomic_write(path, updated)
+            return updated
+    raise ConcurrentUpdate(f"{path} changed during update")
 
 
 def update_text(
