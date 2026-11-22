@@ -210,7 +210,8 @@ def test_json_contract_is_one_object_and_sync_status_is_non_secret(tmp_path, cap
     assert main(["sync", "status", "--json", "--vault", str(vault), "--state-dir", str(state), "--no-semantic"]) == 0
     sync_status = json.loads(capsys.readouterr().out)
     assert set(sync_status) >= {"configured", "remote", "git", "index", "held_secrets", "error"}
-    assert "key" not in json.dumps(sync_status).lower()
+    assert sync_status["key_store"] is None
+    assert "master.key" not in json.dumps(sync_status).lower()
 
 
 def test_scheduler_dry_run_uses_absolute_paths_and_escapes_percent(tmp_path, capsys, monkeypatch):
@@ -525,13 +526,103 @@ def test_keychain_and_pair_keep_key_out_of_argv(tmp_path, monkeypatch):
     actual_key = sync.load_key(config, state, paths)
     calls.clear()
     monkeypatch.setattr(sync.subprocess, "run", fake_run)
-    assert sync.pair(config, "host;$(touch BAD)", remote_vault=str(tmp_path / "peer;bad"), remote_bindery="/opt/bindery;bad").exit_code == 0
+    assert sync.pair(
+        config,
+        "host;$(touch BAD)",
+        remote_vault=str(tmp_path / "peer;bad"),
+        remote_bindery="/opt/bindery;bad",
+        remote_key_store="file",
+    ).exit_code == 0
     command, kwargs = calls[-1]
     assert all(base64.b64encode(actual_key).decode() not in str(arg) for arg in command)
     assert base64.b64encode(actual_key).decode() in kwargs["input"].decode("utf-8")
     assert command[-2] == "host;$(touch BAD)"
     assert "'/opt/bindery;bad'" in command[-1]
+    assert "--key-store file" in command[-1]
     assert base64.b64encode(actual_key).decode() not in paths.state.read_text(encoding="utf-8")
+
+
+def test_auto_keychain_interaction_falls_back_to_private_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(sync.sys, "platform", "darwin")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    remote = _bare(tmp_path)
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    real_run = sync.subprocess.run
+
+    class Completed:
+        stdout = ""
+        stderr = ""
+
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["/usr/bin/security", "find-generic-password"]:
+            return Completed(1)
+        if command[:2] == ["/usr/bin/security", "-i"]:
+            result = Completed(1)
+            result.stderr = "User interaction is not allowed (-25308)"
+            return result
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+    result = sync.init_sync(config, str(remote), write=True)
+    assert result.exit_code == 0
+    paths = sync.paths_for(config)
+    state = json.loads(paths.state.read_text(encoding="utf-8"))
+    assert state["key_store"] == "file"
+    assert paths.root.stat().st_mode & 0o777 == 0o700
+    assert paths.key.stat().st_mode & 0o777 == 0o600
+    assert sync.load_key(config, state, paths) == base64.b64decode(paths.key.read_text().strip())
+
+
+def test_file_key_store_is_recorded_and_reloaded_on_macos(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    remote = _bare(tmp_path)
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    assert sync.init_sync(config, str(remote), write=True, key_store="file").exit_code == 0
+    paths = sync.paths_for(config)
+    state = json.loads(paths.state.read_text(encoding="utf-8"))
+    key = sync.load_key(config, state, paths)
+    assert state["key_store"] == "file"
+
+    monkeypatch.setattr(sync.sys, "platform", "darwin")
+    assert sync.load_key(config, state, paths) == key
+
+
+def test_json_sync_failure_reports_error_on_stderr_and_in_json(tmp_path, monkeypatch, capsys):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    state_dir = tmp_path / "state"
+    remote = _bare(tmp_path)
+    config = Config.resolve(vault=vault, state_dir=state_dir, semantic=False)
+    assert sync.init_sync(config, str(remote), write=True).exit_code == 0
+    real_run = sync.subprocess.run
+
+    class Failed:
+        returncode = 1
+        stdout = b""
+        stderr = b"ssh: peer refused the pairing\n"
+
+    def fake_run(command, **kwargs):
+        if command and command[0] == "ssh":
+            return Failed()
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+    code = main([
+        "sync", "pair", "host", "--json", "--no-semantic",
+        "--vault", str(vault), "--state-dir", str(state_dir),
+    ])
+    captured = capsys.readouterr()
+    assert code == 1
+    payload = json.loads(captured.out)
+    assert "peer refused the pairing" in payload["status"]["error"]
+    assert captured.err.count("\n") == 1
+    assert "peer refused the pairing" in captured.err
+    assert "master.key" not in captured.out
 
 
 def test_accept_key_persists_remote_and_checkpoint_without_init(tmp_path):

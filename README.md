@@ -423,9 +423,15 @@ bindery sync init --remote <URL>  # preview an encrypted remote
 bindery sync init --remote <URL> --write
 bindery sync                      # one encrypted sync run
 bindery sync status --json
+bindery sync init --remote <URL> --key-store file --write
+bindery sync pair <ssh-host> --remote-key-store file
 bindery sync install --interval 300 --write
 bindery sync uninstall --write
 ```
+
+When a sync operation fails with `--json`, stdout remains one JSON status object,
+the `error` field contains the cause, and the command keeps its non-zero exit
+code. A one-line summary is also written to stderr; key material is omitted.
 
 `review` is the one to run every few weeks. It answers: what did the agents keep
 asking that I never wrote down, which notes are doing the work, and what has
@@ -457,12 +463,24 @@ bindery sync                                            # on the paired machine
 ```
 
 The master key is 32 random bytes. Bindery derives separate AES-256-GCM,
-HMAC-name, and key-ID keys with HKDF-SHA256. macOS stores the key in Keychain
-under service `bindery-sync`; other systems use a `0600` file under the state
-directory. The key never enters Git, Vault, logs, state JSON, or process
-arguments. `bindery sync key export` prints a recovery string with a warning;
-store it in a password manager. Losing the key leaves each local plaintext
-Vault intact, but makes the remote ciphertext unreadable.
+HMAC-name, and key-ID keys with HKDF-SHA256. `--key-store auto` is the default
+and can also be set with `BINDERY_KEY_STORE`. On macOS it tries the Keychain
+under service `bindery-sync`; if a non-interactive session receives
+"User interaction is not allowed" it falls back to a `0600` file in the state
+directory. `--key-store keychain` or `--key-store file` selects one explicitly.
+The selected store is recorded as `key_store` in sync state and status; the key
+itself is never written to state JSON. `sync pair --remote-key-store` selects
+the store requested on the peer, including when the peer runs `accept-key` from
+a scheduler or an SSH session.
+
+File storage is on the same device as the plaintext Vault. The protected target
+does not change: the remote and its backups remain the data that the encryption
+is intended to protect. Device backups include the key when they include the
+state directory, so protect those backups accordingly. The key never enters
+Git, the Vault, logs, or process arguments. `bindery sync key export` prints a
+recovery string with a warning; store it in a password manager. Losing the key
+leaves each local plaintext Vault intact, but makes the remote ciphertext
+unreadable.
 
 The manifest is encrypted too. It records relative paths, object IDs, SHA-256
 hashes, byte sizes, and the machine label that last wrote a file. Each
@@ -517,6 +535,7 @@ maintenance step such as `git reflog expire --expire=now --all && git gc
 | --- | --- | --- |
 | `BINDERY_VAULT` | `./memory` | Directory of Markdown notes. |
 | `BINDERY_STATE_DIR` | `~/.bindery` | Where the index lives. |
+| `BINDERY_KEY_STORE` | `auto` | Sync key storage: `auto`, `keychain`, or `file`. |
 | `BINDERY_MAX_TOKENS` | `2000` | Default search response cap. |
 | `BINDERY_LIMIT` | `8` | Default passages per search. |
 | `BINDERY_CHUNK_TOKENS` | `400` | Target passage size. |

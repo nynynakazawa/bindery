@@ -416,9 +416,15 @@ bindery sync init --remote <URL>  # 暗号化リモートの確認だけをす�
 bindery sync init --remote <URL> --write
 bindery sync                      # 1回だけ暗号化同期する
 bindery sync status --json
+bindery sync init --remote <URL> --key-store file --write
+bindery sync pair <ssh-host> --remote-key-store file
 bindery sync install --interval 300 --write
 bindery sync uninstall --write
 ```
+
+`--json` で同期に失敗した場合も、標準出力は JSON の状態オブジェクトだけです。
+`error` に原因を入れ、終了コードは非ゼロのまま返します。標準エラー出力にも原因を1行で表示しますが、
+鍵などの秘密は含めません。
 
 数週間に一度回すべきなのは `review` です。「エージェントが何度も聞いたのに
 書いていなかったこと」「実際に働いているノート」「散らかり始めたもの」が分かります。
@@ -447,11 +453,19 @@ bindery sync                                            # ペアリングした�
 ```
 
 マスター鍵は乱数で作る32バイトです。HKDF-SHA256 で AES-256-GCM 用、名前用 HMAC、鍵 ID 用の
-鍵を分けます。macOS では Keychain の service `bindery-sync` に保存し、それ以外では state
-ディレクトリ内の `0600` ファイルに保存します。鍵は Git、Vault、ログ、state JSON、プロセスの
-引数に出しません。`bindery sync key export` は警告付きで回復用文字列を表示するため、パスワード
-マネージャに保管してください。鍵を失うとリモートの暗号文は読めなくなりますが、各端末の
-平文 Vault は残ります。
+鍵を分けます。既定の `--key-store auto` は `BINDERY_KEY_STORE` でも指定できます。macOS では
+Keychain の service `bindery-sync` を試し、GUI のない SSH セッションで `User interaction is not
+allowed` になった場合だけ state ディレクトリ内の `0600` ファイルへ切り替えます。
+`--key-store keychain` と `--key-store file` で保管先を固定できます。実際に使った保管先は
+同期状態と status の `key_store` に記録しますが、鍵そのものは state JSON に書きません。
+`sync pair --remote-key-store` で相手機の保管先も指定できます。scheduler や SSH セッションから
+実行しても、state に記録した保管先を使います。
+
+file 保管は平文 Vault と同じ端末上にあります。守る対象は変わりません。リモートとそのバックアップ
+を暗号化して守ります。端末のバックアップに state ディレクトリが含まれると鍵も入るため、バックアップ
+の扱いに注意してください。鍵は Git、Vault、ログ、プロセスの引数に出しません。`bindery sync key
+export` は警告付きで回復用文字列を表示するため、パスワードマネージャに保管してください。鍵を失うと
+リモートの暗号文は読めなくなりますが、各端末の平文 Vault は残ります。
 
 manifest も暗号化します。中には相対パス、オブジェクト ID、SHA-256、サイズ、最後に書いた機械
 ラベルを記録します。manifest には単調増加する世代番号と `previous_hash` を持たせます。受信した
@@ -492,6 +506,7 @@ LaunchAgent、Linux では systemd user service と timer を作ります。鍵�
 | ------------------------ | -------------- | ------------------------------------------ |
 | `BINDERY_VAULT`        | `./memory`   | Markdown ノートのディレクトリ。          |
 | `BINDERY_STATE_DIR`    | `~/.bindery` | インデックスの保存先。                   |
+| `BINDERY_KEY_STORE`    | `auto`       | 同期鍵の保管先。`auto`、`keychain`、`file`。 |
 | `BINDERY_MAX_TOKENS`   | `2000`       | 検索応答の既定上限。                     |
 | `BINDERY_LIMIT`        | `8`          | 1検索あたりの既定件数。                  |
 | `BINDERY_CHUNK_TOKENS` | `400`        | 分割後の1箇所の目標サイズ。              |

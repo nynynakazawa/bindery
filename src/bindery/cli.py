@@ -386,12 +386,19 @@ def cmd_clients(args: argparse.Namespace) -> int:
 
 
 def _sync_result_output(result, *, json_output: bool) -> int:
+    status = dict(result.status or {})
+    if result.exit_code:
+        error = status.get("error") or status.get("last_error") or status.get("blocked_reason") or result.message
+        if error:
+            error = " ".join(str(error).split())
+            status["error"] = error
+            print(f"bindery sync: {error}", file=sys.stderr)
     if json_output:
-        print(json.dumps({"exit_code": result.exit_code, "status": result.status}, ensure_ascii=False))
-        return 0
+        print(json.dumps({"exit_code": result.exit_code, "status": status}, ensure_ascii=False))
+        return result.exit_code
     if result.message:
         print(result.message)
-    print(json.dumps(result.status, ensure_ascii=False, indent=2))
+    print(json.dumps(status, ensure_ascii=False, indent=2))
     return result.exit_code
 
 
@@ -408,7 +415,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if action == "init":
-        result = sync.init_sync(config, args.remote, write=args.write, allow_public_host=args.allow_public_host)
+        result = sync.init_sync(
+            config,
+            args.remote,
+            write=args.write,
+            allow_public_host=args.allow_public_host,
+            key_store=getattr(args, "key_store", None),
+        )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
     if action == "pair":
         result = sync.pair(
@@ -417,10 +430,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
             replace=args.replace,
             remote_vault=args.remote_vault,
             remote_bindery=getattr(args, "remote_bindery", None),
+            remote_key_store=getattr(args, "remote_key_store", None),
+            key_store=getattr(args, "key_store", None),
         )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
     if action == "accept-key":
-        result = sync.accept_key(config, args.sync_id, sys.stdin.buffer.read(), replace=args.replace)
+        result = sync.accept_key(
+            config,
+            args.sync_id,
+            sys.stdin.buffer.read(),
+            replace=args.replace,
+            key_store=getattr(args, "key_store", None),
+        )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
     if action == "key-export":
         try:
@@ -438,9 +459,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
         result = sync.uninstall_scheduler(config, write=args.write, emit=not json_output)
         return _sync_result_output(result, json_output=json_output)
     if action == "rekey":
-        result = sync.rekey(config, write=args.write, purge_remote=args.purge_remote)
+        result = sync.rekey(
+            config,
+            write=args.write,
+            purge_remote=args.purge_remote,
+            key_store=getattr(args, "key_store", None),
+        )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
-    result = sync.run_sync(config, allow_public_host=getattr(args, "allow_public_host", False))
+    result = sync.run_sync(
+        config,
+        allow_public_host=getattr(args, "allow_public_host", False),
+        key_store=getattr(args, "key_store", None),
+    )
     return _sync_result_output(result, json_output=getattr(args, "json", False))
 
 
@@ -1378,13 +1408,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync = sub.add_parser("sync", help="Synchronise a vault through an encrypted Git transport.")
     _add_common(p_sync, suppress_defaults=True)
     _add_project(p_sync, suppress_defaults=True)
-    p_sync.add_argument("--json", action="store_true", help="Emit one JSON object and return zero.")
+    p_sync.add_argument("--json", action="store_true", help="Emit one JSON object and preserve the command exit code.")
     p_sync.add_argument("--allow-public-host", action="store_true", help="Allow an explicitly selected public Git host.")
+    p_sync.add_argument("--key-store", choices=("auto", "keychain", "file"), default=argparse.SUPPRESS,
+                         help="Store the sync key in auto-selected Keychain/file storage.")
     sync_sub = p_sync.add_subparsers(dest="sync_action")
 
     def _sync_common(parser):
         _add_common(parser, suppress_defaults=True)
         _add_project(parser, suppress_defaults=True)
+        parser.add_argument("--key-store", choices=("auto", "keychain", "file"), default=argparse.SUPPRESS,
+                            help="Store the sync key in auto-selected Keychain/file storage.")
 
     p_sync.set_defaults(func=cmd_sync, sync_action="run")
     p_sync_status = sync_sub.add_parser("status", help="Show encrypted sync state.")
@@ -1406,6 +1440,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_pair.add_argument("--replace", action="store_true")
     p_sync_pair.add_argument("--remote-vault", help="Absolute Vault path on the peer machine.")
     p_sync_pair.add_argument("--remote-bindery", help="Absolute bindery executable on the peer machine.")
+    p_sync_pair.add_argument("--remote-key-store", choices=("auto", "keychain", "file"), default="auto",
+                             help="Key storage to request on the peer machine.")
     p_sync_pair.add_argument("--json", action="store_true")
     p_sync_pair.set_defaults(func=cmd_sync, sync_action="pair")
 

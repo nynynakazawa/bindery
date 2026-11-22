@@ -9,6 +9,8 @@ Vault には `.git` を作りません。同期用リポジトリは
 
 守る対象は、リモート、リモートのバックアップ、通信経路から見た本文とパス名です。改ざん、
 世代の巻き戻し、履歴の断絶も受理しません。平文 Vault と鍵を持つ端末の侵害は範囲外です。
+file 保管は平文 Vault と同じ端末上にあります。守る対象（リモートとそのバックアップ）は変わりませんが、
+端末のバックアップに state ディレクトリが含まれると鍵も入るため注意が必要です。
 
 ## Git tree と暗号フォーマット
 
@@ -67,9 +69,13 @@ manifest の `generation` は増加し、`previous_hash` は直前の manifest �
 
 ## 鍵の保管と受け渡し
 
-macOS では `security` コマンドを使い、service `bindery-sync` と sync ID を Keychain の account
-にします。登録時の鍵は `security -i` の標準入力へ渡し、取得は `find-generic-password -w` の
-標準出力から行います。macOS 以外では state dir の 0600 ファイルを使います。
+保管先は `--key-store {auto,keychain,file}` または `BINDERY_KEY_STORE` で選べます。既定の `auto` は
+macOS で `security` コマンドを使い、service `bindery-sync` と sync ID を Keychain の account にします。
+`security -i` が `-25308` または `User interaction is not allowed` で失敗したときだけ、state dir 内の
+0700 ディレクトリにある 0600 ファイルへ切り替えます。それ以外の Keychain エラーは停止します。
+state の `key_store` に実際の保管先を記録し、読み出しはその値に固定します。macOS 以外は `auto` でも
+state dir のファイルを使います。`sync pair --remote-key-store` は相手機の `accept-key` に保管先を
+渡します。scheduler と SSH セッションは state に記録した保管先を使います。
 
 鍵は Git、Vault、ログ、state JSON、プロセス引数に書きません。`sync pair <ssh-host>` は
 `StrictHostKeyChecking=yes` の SSH を起動し、鍵と信頼チェックポイントを JSON で標準入力へ渡します。

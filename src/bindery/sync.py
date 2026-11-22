@@ -46,6 +46,7 @@ PUBLIC_HOSTS = {"github.com", "gitlab.com", "bitbucket.org", "codeberg.org"}
 DEFAULT_BRANCH = "main"
 MAX_GIT_TIMEOUT = 30.0
 MAX_SYNC_ATTEMPTS = 3
+KEY_STORES = {"auto", "keychain", "file"}
 
 
 class SyncError(RuntimeError):
@@ -66,6 +67,10 @@ class PlanChanged(SyncError):
 
 class SyncTimeout(SyncError):
     """A Git operation timed out and its remote side effect is unknown."""
+
+
+class KeychainInteractionError(SyncError):
+    """macOS Keychain needs an interactive GUI session."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +114,29 @@ def _sha256(data: bytes) -> str:
 def _short_error(value: object, limit: int = 500) -> str:
     text = " ".join(str(value or "").split())
     return text[:limit]
+
+
+def _key_store_choice(value: str | None, *, use_environment: bool = True) -> str:
+    raw = value
+    if raw is None and use_environment:
+        raw = os.environ.get("BINDERY_KEY_STORE")
+    choice = str(raw or "auto").strip().lower()
+    if choice not in KEY_STORES:
+        raise SyncError("key store must be one of: auto, keychain, file")
+    return choice
+
+
+def _keychain_interaction_error(value: object) -> bool:
+    detail = _short_error(value).lower()
+    return "-25308" in detail or "user interaction is not allowed" in detail or "interaction is not allowed" in detail
+
+
+def _error_without_secrets(value: object, secrets: tuple[bytes, ...] = ()) -> str:
+    message = _short_error(value)
+    for secret in secrets:
+        if secret:
+            message = message.replace(base64.b64encode(secret).decode("ascii"), "[redacted]")
+    return message
 
 
 def _safe_slug(value: str) -> str:
@@ -376,8 +404,16 @@ def _keychain_account(sync_id: str) -> str:
     return sync_id
 
 
+def _ensure_private_key_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
 def _key_file_write(path: Path, key: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_key_dir(path.parent)
     atomic_write(path, base64.b64encode(key).decode("ascii") + "\n")
     try:
         path.chmod(0o600)
@@ -398,7 +434,7 @@ def _keychain_get(sync_id: str) -> bytes | None:
     if result.returncode:
         return None
     try:
-        return base64.b64decode(result.stdout.strip(), validate=True)
+        return base64.b64decode(str(getattr(result, "stdout", "")).strip(), validate=True)
     except (ValueError, base64.binascii.Error):
         return None
 
@@ -420,38 +456,86 @@ def _keychain_put(sync_id: str, key: bytes, *, replace: bool = False) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         raise SyncError(f"Keychain update failed: {_short_error(exc)}") from exc
     if result.returncode:
-        raise SyncError(f"Keychain update failed: {_short_error(result.stderr)}")
+        detail = _short_error(f"{getattr(result, 'stderr', '')} {getattr(result, 'stdout', '')}")
+        message = f"Keychain update failed: {detail}"
+        if _keychain_interaction_error(f"{result.returncode} {message}"):
+            raise KeychainInteractionError(message)
+        raise SyncError(message)
 
 
-def load_key(config, state: dict, paths: SyncPaths) -> bytes:
+def _state_key_store(state: dict, *, requested: str | None = None) -> str:
+    recorded = state.get("key_store")
+    if recorded in {"keychain", "file"}:
+        return str(recorded)
+    choice = _key_store_choice(requested)
+    if choice == "auto":
+        return "keychain" if sys.platform == "darwin" else "file"
+    return choice
+
+
+def _read_file_key(path: Path) -> bytes | None:
+    try:
+        encoded = path.read_text(encoding="ascii").strip()
+        key = base64.b64decode(encoded, validate=True)
+    except (OSError, UnicodeError, ValueError, base64.binascii.Error):
+        return None
+    return key if len(key) == 32 else None
+
+
+def load_key(config, state: dict, paths: SyncPaths, *, key_store: str | None = None) -> bytes:
     sync_id = str(state.get("sync_id", ""))
     if not sync_id:
         raise SyncBlocked("sync is not paired; run sync init or sync pair")
-    if sys.platform == "darwin":
+    selected = _state_key_store(state, requested=key_store)
+    if selected == "keychain":
         key = _keychain_get(sync_id)
     else:
-        try:
-            encoded = paths.key.read_text(encoding="ascii").strip()
-            key = base64.b64decode(encoded, validate=True)
-        except (OSError, UnicodeError, ValueError, base64.binascii.Error):
-            key = None
+        key = _read_file_key(paths.key)
     if key is None or len(key) != 32:
         raise SyncBlocked("sync key is unavailable; pair again or restore it from a password manager")
+    if state.get("key_store") not in {"keychain", "file"}:
+        state["key_store"] = selected
     return key
 
 
-def store_key(config, state: dict, paths: SyncPaths, key: bytes, *, replace: bool = False) -> None:
+def store_key(config, state: dict, paths: SyncPaths, key: bytes, *, replace: bool = False,
+              key_store: str | None = None) -> None:
     if len(key) != 32:
         raise SyncError("sync key must be 32 bytes")
-    if sys.platform == "darwin":
+    if key_store is not None:
+        selected = _key_store_choice(key_store)
+    elif state.get("key_store") in {"keychain", "file"}:
+        selected = str(state["key_store"])
+    else:
+        selected = _key_store_choice(None)
+    if selected == "auto":
+        if sys.platform != "darwin":
+            selected = "file"
+        else:
+            try:
+                _keychain_put(str(state["sync_id"]), key, replace=replace)
+                selected = "keychain"
+            except (KeychainInteractionError, SyncError) as exc:
+                if not _keychain_interaction_error(exc):
+                    raise
+                _key_file_write(paths.key, key)
+                selected = "file"
+            state["key_store"] = selected
+            return
+    if selected == "keychain":
         _keychain_put(str(state["sync_id"]), key, replace=replace)
     else:
+        _ensure_private_key_dir(paths.key.parent)
         if paths.key.exists() and not replace:
-            existing = load_key(config, state, paths)
+            existing = _read_file_key(paths.key)
+            if existing is None:
+                raise SyncBlocked("sync key file is unavailable; pair again or restore it from a password manager")
             if not hmac.compare_digest(existing, key):
                 raise SyncBlocked("a different key is already registered for this sync id")
+            state["key_store"] = "file"
             return
         _key_file_write(paths.key, key)
+    state["key_store"] = selected
 
 
 def derive_keys(master: bytes) -> tuple[bytes, bytes, bytes]:
@@ -1480,6 +1564,7 @@ def _status_from_state(config, state: dict | None = None) -> dict:
         "remote_connection": state.get("remote"),
         "machine": state.get("machine"),
         "sync_id": state.get("sync_id"),
+        "key_store": state.get("key_store"),
         "last_success": state.get("last_success"),
         "last_attempt": state.get("last_attempt"),
         "git": state.get("git", "never"),
@@ -1493,7 +1578,7 @@ def _status_from_state(config, state: dict | None = None) -> dict:
         "scheduler": scheduler[0],
         "interval_seconds": scheduler[1],
         "peers": sorted(set(str(p) for p in state.get("peers", []) if p)),
-        "error": None,
+        "error": state.get("last_error") or state.get("blocked_reason"),
     }
 
 
@@ -1506,8 +1591,10 @@ def sync_status(config) -> dict:
         return status
 
 
-def init_sync(config, remote_value: str, *, write: bool = False, allow_public_host: bool = False) -> SyncResult:
+def init_sync(config, remote_value: str, *, write: bool = False, allow_public_host: bool = False,
+              key_store: str | None = None) -> SyncResult:
     try:
+        requested_key_store = _key_store_choice(key_store)
         if (config.vault / ".git").exists():
             raise SyncBlocked("Vault must not contain a .git directory for encrypted sync")
         remote = validate_remote(remote_value, allow_public_host=allow_public_host)
@@ -1534,13 +1621,15 @@ def init_sync(config, remote_value: str, *, write: bool = False, allow_public_ho
                 "last_attempt": current.get("last_attempt"),
                 "git": current.get("git", "never"),
                 "index": current.get("index", "never"),
+                "blocked_reason": None,
+                "last_error": None,
             }
             key = None
             try:
-                key = load_key(config, state, paths)
+                key = load_key(config, state, paths, key_store=key_store)
             except SyncBlocked:
                 key = os.urandom(32)
-                store_key(config, state, paths, key)
+                store_key(config, state, paths, key, key_store=requested_key_store)
             with vault_lock(config):
                 _register_machine(config, state["machine"], write=True)
             _save_state(paths, state)
@@ -1559,16 +1648,21 @@ def init_sync(config, remote_value: str, *, write: bool = False, allow_public_ho
         state.update({"last_attempt": _now(), "git": "blocked", "blocked_reason": _short_error(exc), "last_error": _short_error(exc)})
         if write:
             _save_state(paths_for(config), state)
-        return SyncResult(2, _status_from_state(config, state), _short_error(exc))
+        status = _status_from_state(config, state)
+        status["error"] = _short_error(exc)
+        return SyncResult(2, status, _short_error(exc))
     except (SyncError, OSError) as exc:
-        return SyncResult(1, sync_status(config), _short_error(exc))
+        status = sync_status(config)
+        status["error"] = _short_error(exc)
+        return SyncResult(1, status, _short_error(exc))
 
 
-def run_sync(config, *, allow_public_host: bool = False) -> SyncResult:
+def run_sync(config, *, allow_public_host: bool = False, key_store: str | None = None) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
     state["last_attempt"] = _now()
     try:
+        _key_store_choice(key_store)
         if (config.vault / ".git").exists():
             raise SyncBlocked("Vault must not contain a .git directory for encrypted sync")
         if not state.get("configured"):
@@ -1577,7 +1671,7 @@ def run_sync(config, *, allow_public_host: bool = False) -> SyncResult:
         paths.root.mkdir(parents=True, exist_ok=True)
         _initialise_repo(paths, remote, write=True)
         _ensure_format(paths, write=True)
-        master = load_key(config, state, paths)
+        master = load_key(config, state, paths, key_store=key_store)
         label = str(state.get("machine") or machine_label(config))
         _register_machine(config, label, write=False)
         with vault_lock(config):
@@ -1824,15 +1918,21 @@ def run_sync(config, *, allow_public_host: bool = False) -> SyncResult:
     except LockTimeout as exc:
         state.update({"git": "blocked", "blocked_reason": "vault or sync lock timeout", "last_error": _short_error(exc)})
         _save_state(paths, state)
-        return SyncResult(2, _status_from_state(config, state), _short_error(exc))
+        status = _status_from_state(config, state)
+        status["error"] = _short_error(exc)
+        return SyncResult(2, status, _short_error(exc))
     except SyncBlocked as exc:
         state.update({"git": "blocked", "blocked_reason": _short_error(exc), "last_error": _short_error(exc)})
         _save_state(paths, state)
-        return SyncResult(2, _status_from_state(config, state), _short_error(exc))
+        status = _status_from_state(config, state)
+        status["error"] = _short_error(exc)
+        return SyncResult(2, status, _short_error(exc))
     except (SyncError, OSError) as exc:
         state.update({"git": "error", "last_error": _short_error(exc)})
         _save_state(paths, state)
-        return SyncResult(1, _status_from_state(config, state), _short_error(exc))
+        status = _status_from_state(config, state)
+        status["error"] = _short_error(exc)
+        return SyncResult(1, status, _short_error(exc))
 
 
 def key_export(config) -> str:
@@ -1842,7 +1942,8 @@ def key_export(config) -> str:
     return "WARNING: store this recovery string in a password manager; it is the only copy of the sync key.\n" + base64.b64encode(key).decode("ascii")
 
 
-def accept_key(config, sync_id: str, payload: bytes, *, replace: bool = False) -> SyncResult:
+def accept_key(config, sync_id: str, payload: bytes, *, replace: bool = False,
+               key_store: str | None = None) -> SyncResult:
     paths = paths_for(config)
     try:
         data = json.loads(payload.decode("utf-8"))
@@ -1853,7 +1954,7 @@ def accept_key(config, sync_id: str, payload: bytes, *, replace: bool = False) -
         existing = state.get("sync_id")
         if existing and existing == sync_id:
             try:
-                old = load_key(config, state, paths)
+                old = load_key(config, state, paths, key_store=key_store)
                 if not hmac.compare_digest(old, key) and not replace:
                     raise SyncBlocked("a different key is already registered; pass --replace")
             except SyncBlocked:
@@ -1870,17 +1971,23 @@ def accept_key(config, sync_id: str, payload: bytes, *, replace: bool = False) -
             "machine": machine_label(config),
             "accepted_generation": int(checkpoint.get("generation", 0)),
             "accepted_manifest": str(checkpoint.get("manifest_hash", "")),
+            "blocked_reason": None,
+            "last_error": None,
         })
         if not state.get("remote"):
             raise SyncBlocked("pairing payload did not include a remote URL")
         paths.root.mkdir(parents=True, exist_ok=True)
-        store_key(config, state, paths, key, replace=replace)
+        store_key(config, state, paths, key, replace=replace, key_store=key_store)
         _save_state(paths, state)
         return SyncResult(0, _status_from_state(config, state), "key accepted")
     except SyncBlocked as exc:
-        return SyncResult(2, _status_from_state(config), _short_error(exc))
+        status = _status_from_state(config)
+        status["error"] = _short_error(exc)
+        return SyncResult(2, status, _short_error(exc))
     except Exception as exc:
-        return SyncResult(1, _status_from_state(config), _short_error(exc))
+        status = _status_from_state(config)
+        status["error"] = _short_error(exc)
+        return SyncResult(1, status, _short_error(exc))
 
 
 def _validate_host_argument(host: str) -> str:
@@ -1899,15 +2006,19 @@ def _remote_command(executable: str | None, args: list[str]) -> str:
 
 
 def pair(config, host: str, *, replace: bool = False, remote_vault: str | None = None,
-         remote_bindery: str | None = None) -> SyncResult:
+         remote_bindery: str | None = None, remote_key_store: str | None = None,
+         key_store: str | None = None) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
+    key: bytes | None = None
     try:
         host = _validate_host_argument(host)
-        key = load_key(config, state, paths)
+        key = load_key(config, state, paths, key_store=key_store)
         command = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "--", host]
+        remote_key_store = _key_store_choice(remote_key_store, use_environment=False)
         remote_args = [
-            "sync", "accept-key", "--sync-id", str(state["sync_id"]), "--vault", str(remote_vault or config.vault)
+            "sync", "accept-key", "--sync-id", str(state["sync_id"]), "--vault", str(remote_vault or config.vault),
+            "--key-store", remote_key_store,
         ]
         if replace:
             remote_args.append("--replace")
@@ -1923,14 +2034,22 @@ def pair(config, host: str, *, replace: bool = False, remote_vault: str | None =
         remote_command = _remote_command(remote_bindery, remote_args)
         result = subprocess.run(command + [remote_command], input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30)
         if result.returncode:
-            raise SyncError(_short_error(result.stderr.decode("utf-8", "replace")))
+            detail = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
+            raise SyncError(_short_error(detail))
         state["peers"] = sorted(set(state.get("peers", [])) | {host})
+        state.update({"blocked_reason": None, "last_error": None})
         _save_state(paths, state)
         return SyncResult(0, _status_from_state(config, state), "paired")
     except SyncBlocked as exc:
-        return SyncResult(2, _status_from_state(config), _short_error(exc))
+        status = _status_from_state(config)
+        message = _error_without_secrets(exc, (key,) if key else ())
+        status["error"] = message
+        return SyncResult(2, status, message)
     except (OSError, subprocess.SubprocessError, SyncError) as exc:
-        return SyncResult(1, _status_from_state(config), _short_error(exc))
+        status = _status_from_state(config)
+        message = _error_without_secrets(exc, (key,) if key else ())
+        status["error"] = message
+        return SyncResult(1, status, message)
 
 
 def _scheduler_paths(config) -> tuple[str, int | None, Path, Path | None]:
@@ -2037,7 +2156,8 @@ def uninstall_scheduler(config, *, write: bool = False, emit: bool = True) -> Sy
         return SyncResult(1, _status_from_state(config), _short_error(exc))
 
 
-def rekey(config, *, write: bool = False, purge_remote: bool = False) -> SyncResult:
+def rekey(config, *, write: bool = False, purge_remote: bool = False,
+          key_store: str | None = None) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
     if not write:
@@ -2048,7 +2168,7 @@ def rekey(config, *, write: bool = False, purge_remote: bool = False) -> SyncRes
         # Rekeying is a root replacement, so it must never be used as a way to
         # skip an ordinary fetch/merge/apply/push cycle first.  This also makes
         # the Vault contents below the result of the latest shared state.
-        preflight = run_sync(config)
+        preflight = run_sync(config, key_store=key_store)
         if preflight.exit_code != 0:
             return SyncResult(
                 preflight.exit_code,
@@ -2059,7 +2179,7 @@ def rekey(config, *, write: bool = False, purge_remote: bool = False) -> SyncRes
         remote = validate_remote(str(state.get("remote", "")))
         if purge_remote and remote.kind not in {"file", "path"}:
             raise SyncError("--purge-remote is only available for a local remote")
-        old_key = load_key(config, state, paths)
+        old_key = load_key(config, state, paths, key_store=key_store)
         new_key = os.urandom(32)
         new_key_id = derive_keys(new_key)[2].hex()
         pending_key = paths.root / "rekey.pending.key"
@@ -2108,10 +2228,7 @@ def rekey(config, *, write: bool = False, purge_remote: bool = False) -> SyncRes
                 # material. The old key is archived, never deleted.
                 old_key_id = derive_keys(old_key)[2].hex()
                 _key_file_write(paths.root / f"master.key.previous-{old_key_id}", old_key)
-                if sys.platform == "darwin":
-                    _keychain_put(str(state["sync_id"]), new_key, replace=True)
-                else:
-                    _key_file_write(paths.key, new_key)
+                store_key(config, state, paths, new_key, replace=True, key_store=key_store)
                 old_repo = paths.root / f"repo.previous-{old_key_id}"
                 if paths.repo.exists():
                     paths.repo.rename(old_repo)
@@ -2144,9 +2261,13 @@ def rekey(config, *, write: bool = False, purge_remote: bool = False) -> SyncRes
     except SyncBlocked as exc:
         state.update({"git": "blocked", "blocked_reason": _short_error(exc), "last_error": _short_error(exc)})
         _save_state(paths, state)
-        return SyncResult(2, _status_from_state(config, state), _short_error(exc))
+        status = _status_from_state(config, state)
+        status["error"] = _short_error(exc)
+        return SyncResult(2, status, _short_error(exc))
     except (OSError, SyncError) as exc:
         state.update({"git": "error", "last_error": _short_error(exc)})
         _save_state(paths, state)
-        return SyncResult(1, _status_from_state(config, state), _short_error(exc))
+        status = _status_from_state(config, state)
+        status["error"] = _short_error(exc)
+        return SyncResult(1, status, _short_error(exc))
 
