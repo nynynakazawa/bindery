@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import signal
 import re
 import shlex
 import socket
@@ -45,6 +46,23 @@ AAD_VERSION = b"bindery-sync/v1"
 PUBLIC_HOSTS = {"github.com", "gitlab.com", "bitbucket.org", "codeberg.org"}
 DEFAULT_BRANCH = "main"
 MAX_GIT_TIMEOUT = 30.0
+
+
+def _network_timeout() -> float:
+    """Seconds allowed for one fetch, push or ls-remote.
+
+    Local git commands finish in well under the 30-second budget, but the
+    first fetch of a vault of a few hundred notes moves tens of megabytes of
+    ciphertext, which over a VPN can take minutes. A timeout here is safe to
+    retry (push timeouts are reconciled by a fetch), so the budget only has
+    to be generous, not exact. Override with BINDERY_SYNC_NETWORK_TIMEOUT.
+    """
+    raw = os.environ.get("BINDERY_SYNC_NETWORK_TIMEOUT", "").strip()
+    try:
+        value = float(raw) if raw else 600.0
+    except ValueError:
+        value = 600.0
+    return value if value > 0 else 600.0
 MAX_SYNC_ATTEMPTS = 3
 KEY_STORES = {"auto", "keychain", "file"}
 
@@ -268,19 +286,40 @@ def _git_options(paths: SyncPaths) -> list[str]:
     ]
 
 
+def _run_killing_group(command: list[str], *, input_data: bytes | None, env: dict[str, str],
+                       timeout: float) -> subprocess.CompletedProcess:
+    """Run ``command`` in its own process group and kill the whole group on timeout.
+
+    ``subprocess.run(timeout=...)`` kills only git itself. A fetch or push
+    runs ssh as a child, and that ssh survives git, keeps the connection
+    open, and leaves git-upload-pack / index-pack waiting on the far side
+    indefinitely. Killing the group ends the transport as well.
+    """
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(input=input_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def _git(paths: SyncPaths, *args: str, input_data: bytes | None = None, timeout: float = MAX_GIT_TIMEOUT,
          check: bool = True) -> subprocess.CompletedProcess:
     command = ["git", *(_git_options(paths)), "-C", str(paths.repo), *args]
     try:
-        result = subprocess.run(
-            command,
-            input=input_data,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_git_env(),
-            timeout=timeout,
-            check=False,
-        )
+        result = _run_killing_group(command, input_data=input_data, env=_git_env(), timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise SyncTimeout(f"git operation timed out: {_short_error(exc)}") from exc
     except OSError as exc:
@@ -332,6 +371,22 @@ def _initialise_repo(paths: SyncPaths, remote: Remote, *, write: bool) -> None:
         raise SyncBlocked("remote name bindery is already configured for another destination")
     if not existing:
         _git(paths, "remote", "add", "bindery", _remote_for_git(remote))
+
+
+def _point_repo_at(paths: SyncPaths, remote: Remote) -> None:
+    """Keep the private sync repository's remote equal to the validated state.
+
+    The repository under the state directory belongs to Bindery alone, and the
+    state file is the record of where this machine syncs to. A re-pair with a
+    different spelling of the remote updates the state, so the repository
+    follows it rather than silently pushing to the old destination.
+    """
+    wanted = _remote_for_git(remote)
+    existing = _git_text(paths, "remote", "get-url", "bindery", check=False)
+    if not existing:
+        _git(paths, "remote", "add", "bindery", wanted)
+    elif existing != wanted:
+        _git(paths, "remote", "set-url", "bindery", wanted)
 
 
 def _ensure_format(paths: SyncPaths, *, write: bool) -> None:
@@ -715,12 +770,13 @@ def _manifest_files(manifest: dict) -> dict[str, dict]:
 
 
 def _fetch(paths: SyncPaths) -> None:
-    result = _git(paths, "fetch", "--prune", "bindery", f"+refs/heads/{DEFAULT_BRANCH}:refs/remotes/bindery/{DEFAULT_BRANCH}", check=False)
+    result = _git(paths, "fetch", "--prune", "bindery", f"+refs/heads/{DEFAULT_BRANCH}:refs/remotes/bindery/{DEFAULT_BRANCH}",
+                  check=False, timeout=_network_timeout())
     if result.returncode:
         # An empty freshly-created bare repository has no main ref yet. That
         # is the only fetch failure we treat as an empty remote; transport and
         # authentication failures remain ordinary errors.
-        probe = _git(paths, "ls-remote", "--heads", "bindery", check=False)
+        probe = _git(paths, "ls-remote", "--heads", "bindery", check=False, timeout=_network_timeout())
         if probe.returncode or probe.stdout.strip():
             raise SyncError(_short_error(result.stderr.decode("utf-8", "replace")))
 
@@ -1407,7 +1463,7 @@ def _push(paths: SyncPaths, commit: str, *, force: bool = False,
         force_option = ["--force"] if force else []
     args = ["push"] + force_option + ["bindery", f"{commit}:refs/heads/{DEFAULT_BRANCH}"]
     try:
-        result = _git(paths, *args, check=False)
+        result = _git(paths, *args, check=False, timeout=_network_timeout())
     except SyncTimeout:
         # A timeout does not tell us whether the server accepted the ref. A
         # fetch makes that result observable without inventing a second commit.
@@ -1670,6 +1726,7 @@ def run_sync(config, *, allow_public_host: bool = False, key_store: str | None =
         remote = validate_remote(str(state.get("remote", "")), allow_public_host=allow_public_host)
         paths.root.mkdir(parents=True, exist_ok=True)
         _initialise_repo(paths, remote, write=True)
+        _point_repo_at(paths, remote)
         _ensure_format(paths, write=True)
         master = load_key(config, state, paths, key_store=key_store)
         label = str(state.get("machine") or machine_label(config))
@@ -2007,12 +2064,17 @@ def _remote_command(executable: str | None, args: list[str]) -> str:
 
 def pair(config, host: str, *, replace: bool = False, remote_vault: str | None = None,
          remote_bindery: str | None = None, remote_key_store: str | None = None,
-         key_store: str | None = None) -> SyncResult:
+         key_store: str | None = None, peer_remote: str | None = None) -> SyncResult:
     paths = paths_for(config)
     state = _load_state(paths)
     key: bytes | None = None
     try:
         host = _validate_host_argument(host)
+        # The remote URL is written from this machine's point of view. A peer
+        # that hosts the bare repository itself, or reaches it under another
+        # SSH alias, needs its own spelling; validate it here so a bad value
+        # fails before the key leaves this machine.
+        peer_remote_value = validate_remote(peer_remote).value if peer_remote else state.get("remote")
         key = load_key(config, state, paths, key_store=key_store)
         command = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "--", host]
         remote_key_store = _key_store_choice(remote_key_store, use_environment=False)
@@ -2025,7 +2087,7 @@ def pair(config, host: str, *, replace: bool = False, remote_vault: str | None =
         payload = _json_bytes({
             "sync_id": state["sync_id"],
             "key": base64.b64encode(key).decode("ascii"),
-            "remote": state.get("remote"),
+            "remote": peer_remote_value,
             "checkpoint": {
                 "generation": state.get("accepted_generation", 0),
                 "manifest_hash": state.get("accepted_manifest", ""),

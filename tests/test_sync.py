@@ -541,6 +541,18 @@ def test_keychain_and_pair_keep_key_out_of_argv(tmp_path, monkeypatch):
     assert "--key-store file" in command[-1]
     assert base64.b64encode(actual_key).decode() not in paths.state.read_text(encoding="utf-8")
 
+    # The peer that hosts the bare repository reaches it by a local path, not
+    # by the SSH alias this machine uses; --peer-remote carries that spelling.
+    calls.clear()
+    peer_path = str(tmp_path / "peer-side" / "remote.git")
+    assert sync.pair(config, "host", peer_remote=peer_path).exit_code == 0
+    sent = json.loads(calls[-1][1]["input"].decode("utf-8"))
+    assert sent["remote"] == peer_path
+    calls.clear()
+    rejected = sync.pair(config, "host", peer_remote="ext::sh -c touch% /tmp/pwned")
+    assert rejected.exit_code != 0
+    assert calls == []
+
 
 def test_auto_keychain_interaction_falls_back_to_private_file(tmp_path, monkeypatch):
     monkeypatch.setattr(sync.sys, "platform", "darwin")
@@ -907,3 +919,54 @@ def test_sync_returns_blocked_on_vault_lock_timeout_without_writing(tmp_path, mo
     assert result.exit_code == 2
     assert not sync.paths_for(config).transaction.exists()
 
+
+
+def test_sync_follows_a_remote_changed_by_a_later_pairing(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("hello\n", encoding="utf-8")
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    first = _bare(tmp_path / "first")
+    assert sync.init_sync(config, str(first), write=True).exit_code == 0
+    assert sync.run_sync(config).exit_code == 0
+
+    # A later pairing rewrites the state with another spelling of the remote
+    # (here: a different bare repository that already holds the same history).
+    second = tmp_path / "second.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(first), str(second)], check=True)
+    paths = sync.paths_for(config)
+    state = json.loads(paths.state.read_text(encoding="utf-8"))
+    state["remote"] = str(second)
+    state["remote_display"] = str(second)
+    paths.state.write_text(json.dumps(state), encoding="utf-8")
+
+    (vault / "later.md").write_text("after re-pair\n", encoding="utf-8")
+    assert sync.run_sync(config).exit_code == 0
+    url = subprocess.run(["git", "-C", str(paths.repo), "remote", "get-url", "bindery"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    assert url == str(second)
+    ref = f"refs/heads/{sync.DEFAULT_BRANCH}"
+    first_head = subprocess.run(["git", "-C", str(first), "rev-parse", ref], capture_output=True, text=True, check=True).stdout
+    second_head = subprocess.run(["git", "-C", str(second), "rev-parse", ref], capture_output=True, text=True, check=True).stdout
+    # The new commit went to the new remote, not the old one.
+    assert first_head != second_head
+
+
+def test_network_git_operations_get_a_longer_configurable_timeout(monkeypatch):
+    monkeypatch.delenv("BINDERY_SYNC_NETWORK_TIMEOUT", raising=False)
+    assert sync._network_timeout() >= 300
+    monkeypatch.setenv("BINDERY_SYNC_NETWORK_TIMEOUT", "45")
+    assert sync._network_timeout() == 45
+    monkeypatch.setenv("BINDERY_SYNC_NETWORK_TIMEOUT", "nonsense")
+    assert sync._network_timeout() >= 300
+
+
+def test_timeout_kills_the_whole_process_group(tmp_path):
+    marker = tmp_path / "child-survived"
+    # The shell starts a background child (standing in for ssh) and waits.
+    script = f"(sleep 3; touch {marker}) & wait"
+    with pytest.raises(subprocess.TimeoutExpired):
+        sync._run_killing_group(["/bin/sh", "-c", script], input_data=None, env={"PATH": "/usr/bin:/bin"}, timeout=0.5)
+    import time
+    time.sleep(3.5)
+    assert not marker.exists()

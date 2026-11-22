@@ -432,6 +432,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             remote_bindery=getattr(args, "remote_bindery", None),
             remote_key_store=getattr(args, "remote_key_store", None),
             key_store=getattr(args, "key_store", None),
+            peer_remote=getattr(args, "peer_remote", None),
         )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
     if action == "accept-key":
@@ -1440,6 +1441,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_pair.add_argument("--replace", action="store_true")
     p_sync_pair.add_argument("--remote-vault", help="Absolute Vault path on the peer machine.")
     p_sync_pair.add_argument("--remote-bindery", help="Absolute bindery executable on the peer machine.")
+    p_sync_pair.add_argument("--peer-remote",
+                             help="The remote URL as the peer machine should spell it (default: this "
+                                  "machine's). Use a local path when the peer hosts the bare repository.")
     p_sync_pair.add_argument("--remote-key-store", choices=("auto", "keychain", "file"), default="auto",
                              help="Key storage to request on the peer machine.")
     p_sync_pair.add_argument("--json", action="store_true")
