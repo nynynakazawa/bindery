@@ -336,13 +336,30 @@ def _registered_vault(spec: dict) -> str | None:
     return None
 
 
-def _classify_process(command: str) -> str:
-    lower = command.lower()
-    if "antigravity" in lower or re.search(r"\bagy\b", lower):
+_INTERPRETERS = {"node", "python", "python3", "bun", "deno", "sh", "bash", "zsh", "env"}
+
+
+def _classify_executable(executable: str, command: str = "") -> str:
+    """Name the agent from a process's executable, never from its arguments.
+
+    Matching words anywhere in the command line misreads prompts: an agent
+    asked about "bindery" or "claude" would be attributed to the wrong client.
+    When the executable is an interpreter (an npm-installed CLI runs as node),
+    the script it runs is the program, so look at that path instead.
+    """
+    name = Path(executable).name.lower()
+    if name in _INTERPRETERS or name.startswith("python"):
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+        script = next((part for part in parts[1:] if not part.startswith("-")), "")
+        name = Path(script).name.lower()
+    if name in {"agy", "antigravity"} or name.startswith("antigravity"):
         return "antigravity"
-    if "claude" in lower:
+    if name in {"claude", "claude-code"} or name.startswith("claude"):
         return "claude"
-    if "codex" in lower:
+    if name.startswith("codex"):
         return "codex"
     return "unknown"
 
@@ -364,8 +381,19 @@ def _connections() -> list[dict]:
             ["ps", "-axo", "pid=,ppid=,lstart=,command="],
             capture_output=True, text=True, check=False, timeout=5,
         )
+        # `comm` is the executable path alone, which may contain spaces
+        # (".../Application Support/..."), so it cannot be cut out of `command`.
+        names = subprocess.run(
+            ["ps", "-axo", "pid=,comm="],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
     except (OSError, subprocess.SubprocessError):
         return []
+    executables: dict[int, str] = {}
+    for line in names.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            executables[int(parts[0])] = parts[1]
     rows: dict[int, dict] = {}
     for line in result.stdout.splitlines():
         match = re.match(r"\s*(\d+)\s+(\d+)\s+(.{24})\s+(.*)", line)
@@ -385,10 +413,12 @@ def _connections() -> list[dict]:
         current = row
         client = "unknown"
         visited: set[int] = set()
+        current = rows.get(row["ppid"])  # the server itself is never the client
         while current and current["pid"] not in visited:
             visited.add(current["pid"])
-            detected = _classify_process(current["command"])
-            if detected != "unknown" and "bindery" not in current["command"].lower():
+            executable = executables.get(current["pid"], current["command"].split(" ", 1)[0])
+            detected = _classify_executable(executable, current["command"])
+            if detected != "unknown":
                 client = detected
                 break
             current = rows.get(current["ppid"])

@@ -353,3 +353,33 @@ def test_sync_run_json_includes_held_and_conflict_paths_when_blocked(config, cap
     assert result["status"]["blocked_reason"]
     assert result["status"]["held_paths"] == ["work/held.env"]
     assert result["status"]["conflict_paths"] == [conflict]
+
+
+def test_connections_are_classified_by_executable_not_prompt(monkeypatch):
+    """A prompt that mentions another tool must not change who is connected."""
+    import subprocess as sp
+    from bindery import cli
+
+    commands = "\n".join([
+        "  100     1 Sun Nov 22 22:00:00 2026 agy --mode plan -p ask bindery and claude about codex",
+        "  101   100 Sun Nov 22 22:00:01 2026 /tools/bin/python3 /home/u/.local/bin/bindery --vault /v serve",
+        "  200     1 Sun Nov 22 22:00:00 2026 /opt/codex/bin/codex exec use the bindery memory",
+        "  201   200 Sun Nov 22 22:00:01 2026 /tools/bin/python3 /home/u/.local/bin/bindery --vault /v serve",
+        "  300     1 Sun Nov 22 22:00:00 2026 node /usr/local/lib/node_modules/@openai/codex/bin/codex.js",
+        "  301   300 Sun Nov 22 22:00:01 2026 /tools/bin/python3 /home/u/.local/bin/bindery serve",
+        "  400     1 Sun Nov 22 22:00:00 2026 /Users/u/Library/Application Support/Claude/claude.app/Contents/MacOS/claude --print codex",
+        "  401   400 Sun Nov 22 22:00:01 2026 /tools/bin/python3 /home/u/.local/bin/bindery serve",
+    ])
+    comms = "\n".join([
+        "100 agy", "101 /tools/bin/python3", "200 /opt/codex/bin/codex", "201 /tools/bin/python3",
+        "300 node", "301 /tools/bin/python3",
+        "400 /Users/u/Library/Application Support/Claude/claude.app/Contents/MacOS/claude", "401 /tools/bin/python3",
+    ])
+
+    def fake_run(args, **kwargs):
+        out = comms if "pid=,comm=" in args else commands
+        return sp.CompletedProcess(args, 0, out + "\n", "")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    found = {row["pid"]: row["client"] for row in cli._connections()}
+    assert found == {101: "antigravity", 201: "codex", 301: "codex", 401: "claude"}
