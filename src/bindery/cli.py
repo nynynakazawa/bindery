@@ -467,8 +467,14 @@ def _sync_result_output(result, *, json_output: bool) -> int:
 def cmd_sync(args: argparse.Namespace) -> int:
     from . import sync
 
-    config = _config_from(args)
     action = getattr(args, "sync_action", "run")
+    hold_secrets = getattr(args, "hold_secrets", False)
+    if hold_secrets and action not in {"run", "init", "pair", "accept-key", "install", "rekey"}:
+        return _sync_result_output(
+            sync.SyncResult(2, {}, f"--hold-secrets does not apply to sync {action.replace('key-export', 'key export')}"),
+            json_output=getattr(args, "json", False),
+        )
+    config = _config_from(args)
     if action == "status":
         json_output = getattr(args, "json", False)
         payload = sync.sync_status(config, include_paths=json_output)
@@ -484,6 +490,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             write=args.write,
             allow_public_host=args.allow_public_host,
             key_store=getattr(args, "key_store", None),
+            hold_secrets=hold_secrets,
         )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
     if action == "pair":
@@ -496,6 +503,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             remote_key_store=getattr(args, "remote_key_store", None),
             key_store=getattr(args, "key_store", None),
             peer_remote=getattr(args, "peer_remote", None),
+            hold_secrets=hold_secrets,
         )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
     if action == "accept-key":
@@ -505,6 +513,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             sys.stdin.buffer.read(),
             replace=args.replace,
             key_store=getattr(args, "key_store", None),
+            hold_secrets=hold_secrets,
         )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
     if action == "key-export":
@@ -516,7 +525,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
             return 1
     if action == "install":
         json_output = getattr(args, "json", False)
-        result = sync.install_scheduler(config, args.interval, write=args.write, emit=not json_output)
+        result = sync.install_scheduler(
+            config, args.interval, write=args.write, emit=not json_output,
+            hold_secrets=hold_secrets,
+        )
         return _sync_result_output(result, json_output=json_output)
     if action == "uninstall":
         json_output = getattr(args, "json", False)
@@ -528,6 +540,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             write=args.write,
             purge_remote=args.purge_remote,
             key_store=getattr(args, "key_store", None),
+            hold_secrets=hold_secrets,
         )
         return _sync_result_output(result, json_output=getattr(args, "json", False))
     result = sync.run_sync(
@@ -535,6 +548,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         allow_public_host=getattr(args, "allow_public_host", False),
         key_store=getattr(args, "key_store", None),
         include_paths=getattr(args, "json", False),
+        hold_secrets=hold_secrets,
     )
     return _sync_result_output(result, json_output=getattr(args, "json", False))
 
@@ -1540,6 +1554,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_project(p_sync, suppress_defaults=True)
     p_sync.add_argument("--json", action="store_true", help="Emit one JSON object and preserve the command exit code.")
     p_sync.add_argument("--allow-public-host", action="store_true", help="Allow an explicitly selected public Git host.")
+
+    def _sync_hold_option(parser, *, default=argparse.SUPPRESS,
+                          help_text="Hold local changes that contain suspected secrets."):
+        parser.add_argument("--hold-secrets", action="store_true", default=default, help=help_text)
+
+    _sync_hold_option(p_sync, default=False)
     p_sync.add_argument("--key-store", choices=("auto", "keychain", "file"), default=argparse.SUPPRESS,
                          help="Store the sync key in auto-selected Keychain/file storage.")
     sync_sub = p_sync.add_subparsers(dest="sync_action")
@@ -1558,6 +1578,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sync_init = sync_sub.add_parser("init", help="Configure an encrypted remote.")
     _sync_common(p_sync_init)
+    _sync_hold_option(p_sync_init, help_text="Hold suspected secrets in the preview or the first sync after --write.")
     p_sync_init.add_argument("--remote", required=True)
     p_sync_init.add_argument("--write", action="store_true")
     p_sync_init.add_argument("--json", action="store_true")
@@ -1566,6 +1587,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sync_pair = sync_sub.add_parser("pair", help="Send the key over SSH without putting it in argv.")
     _sync_common(p_sync_pair)
+    _sync_hold_option(p_sync_pair, help_text="Hold suspected secrets in the peer's first sync after pairing.")
     p_sync_pair.add_argument("host")
     p_sync_pair.add_argument("--replace", action="store_true")
     p_sync_pair.add_argument("--remote-vault", help="Absolute Vault path on the peer machine.")
@@ -1580,6 +1602,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_accept = sync_sub.add_parser("accept-key", help="Receive a key on stdin from a trusted peer.")
     _sync_common(p_accept)
+    _sync_hold_option(p_accept, help_text="Hold suspected secrets in the first sync after accepting the key.")
     p_accept.add_argument("--sync-id", required=True)
     p_accept.add_argument("--replace", action="store_true")
     p_accept.add_argument("--json", action="store_true")
@@ -1594,6 +1617,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_install_sync = sync_sub.add_parser("install", help="Install the opt-in scheduler.")
     _sync_common(p_install_sync)
+    _sync_hold_option(p_install_sync, help_text="Hold suspected secrets in scheduled runs.")
     p_install_sync.add_argument("--interval", type=int, default=300)
     p_install_sync.add_argument("--write", action="store_true")
     p_install_sync.add_argument("--json", action="store_true")
@@ -1607,6 +1631,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rekey = sync_sub.add_parser("rekey", help="Replace the encryption root (explicit and destructive).")
     _sync_common(p_rekey)
+    _sync_hold_option(p_rekey)
     p_rekey.add_argument("--write", action="store_true")
     p_rekey.add_argument("--purge-remote", action="store_true")
     p_rekey.add_argument("--json", action="store_true")

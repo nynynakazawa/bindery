@@ -54,6 +54,8 @@ export interface SyncInfo {
   conflicts: number;
   held_secrets: number;
   held_paths?: string[];
+  secret_count?: number;
+  secret_paths?: string[];
   conflict_paths?: string[];
   scheduler: SchedulerState;
   interval_seconds: number | null;

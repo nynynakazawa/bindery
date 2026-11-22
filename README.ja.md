@@ -483,15 +483,20 @@ AES-GCM の認証失敗、世代の巻き戻し、履歴の断絶、安全でな
 この方式が守るのは、リモートや通信経路から見たノート本文とパス名です。平文 Vault と鍵を持つ
 端末そのものが侵害された場合は守れません。Git からはコミット数と順序、ファイル数、暗号文の
 サイズ、更新頻度が分かります。秘密検出は正規表現なので、短い値や未知の形式を見逃すことがあります。
-端末内で秘密を検出したファイルは送らず、ローカルに残して `sync status` に保留数を表示します。
+秘密情報らしき内容を含む Markdown も既定で同期し、`sync status --json` に一覧を表示します。
+リモートには暗号文を保存し、ペアリングした端末の Vault には平文で届きます。ローカルの変更を
+保留したいときは `bindery sync --hold-secrets` を実行するか、`BINDERY_SYNC_HOLD_SECRETS=1` を
+設定してください。受信したノートは、検出を警告として記録したうえで適用します。
 
 計画は state に暗号化 object の参照を保存するため、停止後も残りの書き込みを再開できます。衝突時は
 衝突コピーを先に書き、元パスを最後に書きます。適用中のハッシュ不一致は計画を破棄し、同じ実行内で
 最大3回走査します。暗号化回数は鍵 ID ごとに実際の暗号化だけを数えます。
 
 スケジューラは opt-in で、既定はドライランです。`sync install --write` は macOS ではユーザーの
-LaunchAgent、Linux では systemd user service と timer を作ります。鍵を交換する
-`sync rekey --write` は新しい鍵を作る前に fetch し、通常の同期（統合、適用、push）を成功させます。
+LaunchAgent、Linux では systemd user service と timer を作ります。定期実行で保留を有効にするには、
+`sync install --write --hold-secrets` を実行するか、登録時に `BINDERY_SYNC_HOLD_SECRETS=1` を設定します。
+鍵を交換する `sync rekey --write` は、新しい鍵を作る前に fetch し、通常の同期（統合、適用、push）を
+完了します。
 ローカルの同期 HEAD とリモート HEAD が一致したことを確認して新しい根を作り、観測した HEAD を lease
 に指定して force push します。根の作成中に別端末が push して HEAD が変わると push を拒否し、旧鍵を
 残したまま中止します。成功後は旧鍵と旧ローカルリポジトリを退避します。

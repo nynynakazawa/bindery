@@ -35,6 +35,7 @@
   "sync.index.never": "索引は未作成です",
   "sync.conflicts": "衝突コピー",
   "sync.heldSecrets": "秘密情報で保留",
+  "sync.syncedSecrets": "秘密情報らしき内容を含むノート（同期済み）",
   "sync.blockedReason": "停止理由",
   "sync.remote": "リモート",
   "sync.scheduler": "自動同期",

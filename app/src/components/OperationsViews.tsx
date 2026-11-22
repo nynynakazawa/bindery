@@ -4,7 +4,7 @@ import FolderOpenOutlined from "@mui/icons-material/FolderOpenOutlined";
 import CheckOutlined from "@mui/icons-material/CheckOutlined";
 import { t } from "../copy";
 import type { BinderySnapshot, CommandResult } from "../types";
-import { clientLabels } from "../lib/presentation";
+import { clientLabels, formatSyncState, syncAttentionCount } from "../lib/presentation";
 import type { NoteLocation } from "../lib/noteLinks";
 import { dateTime, LoadingRows, Panel, Problem, relativeTime, SyncIndicator, unavailable } from "./DashboardParts";
 import { StatusDot } from "./StatusDot";
@@ -81,6 +81,10 @@ export function SyncView({ snapshot, syncing, error, retry, refresh, goSettings,
     ...(sync.held_paths ?? []).map((path) => ({ path, label: t("sync.heldSecrets") })),
     ...(sync.conflict_paths ?? []).map((path) => ({ path, label: t("sync.conflicts") })),
   ];
+  const heldPaths = new Set(sync.held_paths);
+  const syncedSecrets = sync.secret_paths?.filter((path) => !heldPaths.has(path)) ?? [];
+  const state = formatSyncState(sync);
+  const stopped = state === "blocked" || state === "error";
   const scheduler = t(`sync.scheduler.${sync.scheduler}`);
   const interval = sync.interval_seconds != null ? ` · ${t("sync.interval", { count: sync.interval_seconds })}` : "";
   const lastError = error || sync.error || sync.last_error;
@@ -95,8 +99,8 @@ export function SyncView({ snapshot, syncing, error, retry, refresh, goSettings,
       action={<Button color="inherit" onClick={() => void run(window.bindery.openLog)}>{t("actions.openLog")}</Button>} />}
     {!sync.configured && !sync.error && <div className="notice"><span>{t("sync.unconfigured")}</span><Button color="inherit" onClick={goSettings}>{t("sync.configure")}</Button></div>}
     <div id="sync-attention">
-      {paths.length || sync.blocked_reason || sync.conflicts || sync.held_secrets ? <Panel title={t("sync.attention")}>
-        {sync.blocked_reason && <div className="attention-row"><span className="mini-chip error-outline">{t("sync.blockedReason")}</span><span>{sync.blocked_reason}</span></div>}
+      {syncAttentionCount(sync) ? <Panel title={t("sync.attention")}>
+        {stopped && <div className="attention-row"><span className="mini-chip error-outline">{t("sync.stopped")}</span><span>{sync.blocked_reason || sync.last_error || sync.error}</span></div>}
         {paths.map(({ path, label }) => <div className="attention-row" key={`${label}:${path}`}>
           <ButtonBase className="attention-file" onClick={() => open({ path })}>
             <span className="mini-chip warning-outline">{label}</span><span className="mono ellipsis" title={path}>{path}</span>
@@ -107,6 +111,11 @@ export function SyncView({ snapshot, syncing, error, retry, refresh, goSettings,
         {!sync.held_paths?.length && Boolean(sync.held_secrets) && <div className="attention-row">{t("sync.heldSecrets")} · {t("common.count", { count: sync.held_secrets })}</div>}
       </Panel> : <Panel className="nothing-to-check"><CheckOutlined />{t("sync.noAttention")}</Panel>}
     </div>
+    {syncedSecrets.length > 0 && <Panel title={t("sync.syncedSecrets")} className="sync-secret-notes">
+      {syncedSecrets.map((path) => <ButtonBase className="sync-secret-note" key={path} onClick={() => open({ path })}>
+        <span className="mono ellipsis" title={path}>{path}</span>
+      </ButtonBase>)}
+    </Panel>}
     <Panel title={t("sync.details")}>
       <div className="sync-details">
         <dl className="key-values">

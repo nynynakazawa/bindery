@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell, Tray } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell, systemPreferences, Tray } from "electron";
 import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -343,9 +343,29 @@ function registerIpc(): void {
   });
 }
 
+// A new status item is added at the left end of the menu bar items. On a
+// crowded MacBook menu bar that is behind the notch, under the frontmost app's
+// menus, so the icon is invisible. macOS reads the item's position (distance
+// from the right edge) from this default before creating it; seeding it once
+// puts the icon beside the clock. Once the user moves the icon, macOS saves the
+// new position and this leaves it alone.
+const TRAY_POSITION_KEY = "NSStatusItem Preferred Position Item-0";
+const TRAY_POSITION_FROM_RIGHT = 220;
+
+function placeTrayNearClockOnFirstRun(): void {
+  if (process.platform !== "darwin") return;
+  try {
+    const current = systemPreferences.getUserDefault(TRAY_POSITION_KEY, "float");
+    if (!current) systemPreferences.setUserDefault(TRAY_POSITION_KEY, "float", TRAY_POSITION_FROM_RIGHT);
+  } catch {
+    // Position is cosmetic; never block the tray on it.
+  }
+}
+
 async function createTray(): Promise<void> {
   const language = app.getLocale().toLowerCase().startsWith("en") ? "en" : "ja";
   const copy = JSON.parse(await readFile(path.join(app.getAppPath(), "src", "copy", `${language}.json`), "utf8")) as Record<string, string>;
+  placeTrayNearClockOnFirstRun();
   tray = new Tray(safeNativeImage("trayTemplate.png"));
   tray.setToolTip("Bindery");
   const menu = Menu.buildFromTemplate([

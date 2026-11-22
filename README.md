@@ -506,9 +506,13 @@ This protects note contents and path names in the remote and in transit from a
 remote observer or a tampered remote. It does not protect a machine that has
 both the plaintext Vault and the key. Git still reveals commit count and order,
 file count, ciphertext sizes, and update frequency. The regular-expression
-secret detector can miss short or unknown credential formats. A secret held in
-the local Vault is not sent; it remains visible locally and is reported in
-`sync status`.
+secret detector can miss short or unknown credential formats. By default,
+Bindery syncs Markdown notes that contain suspected secrets and lists them in
+`sync status --json`. The remote stores ciphertext, and paired devices receive
+the notes as plaintext in their Vaults. To hold local changes that contain
+suspected secrets, run `bindery sync --hold-secrets` or set
+`BINDERY_SYNC_HOLD_SECRETS=1`. Notes received from the remote are still applied
+and flagged.
 
 The transaction is stored with encrypted object references, so a stopped apply
 can resume without putting plaintext in state. Conflict copies are written
@@ -518,7 +522,9 @@ and increment only for actual encryption calls.
 
 The scheduler is opt-in and defaults to a dry run. `sync install --write`
 creates a user LaunchAgent on macOS or a systemd user service and timer on
-Linux. Before creating a new key, `sync rekey --write` fetches and completes a
+Linux. Use `sync install --write --hold-secrets` or set
+`BINDERY_SYNC_HOLD_SECRETS=1` at installation to enable holding in scheduled runs.
+Before creating a new key, `sync rekey --write` fetches and completes a
 normal sync, including merge, apply, and push. It checks that local and remote
 HEADs match, then uses a force-with-lease push for the new root. If a peer
 changes the remote HEAD while the root is being built, the push is rejected and

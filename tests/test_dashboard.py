@@ -320,24 +320,31 @@ def test_recent_lists_dated_journal_headings(config, capsys):
 def test_sync_status_lists_held_and_current_conflict_paths(config, tmp_path, capsys):
     assert not config.state_dir.exists()
     empty = invoke(config, capsys, "sync", "status", "--json")
-    assert empty["held_paths"] == empty["conflict_paths"] == []
+    assert empty["held_paths"] == empty["conflict_paths"] == empty["secret_paths"] == []
     assert not config.state_dir.exists()
 
     paths = sync.paths_for(config)
-    sync._save_state(paths, {"held_secrets": ["work/保留.md", "../unsafe.md"], "conflicts": 7})
+    sync._save_state(paths, {
+        "held_secrets": ["work/保留.md", "../unsafe.md"],
+        "conflicts": 7,
+        "secret_paths": ["work/secret.md", "work/missing.md", "../unsafe.md", "secret-link.md"],
+    })
     conflict = sync._conflict_path("work/note.md", "a" * 64)
+    write_note(config.vault, "work/secret.md", "Test note")
     write_note(config.vault, conflict, "Conflict content")
     write_note(config.vault, "work/not-a.conflict-draft.md", "Not a generated copy")
     outside = write_note(tmp_path, "outside.md", "Outside")
     (config.vault / "link.conflict-0123456789ab.md").symlink_to(outside)
+    (config.vault / "secret-link.md").symlink_to(outside)
 
     result = invoke(config, capsys, "sync", "status", "--json")
     assert result == {
         **sync.sync_status(config),
         "held_paths": ["work/保留.md"],
         "conflict_paths": [conflict],
+        "secret_paths": ["work/secret.md"],
     }
-    assert result["held_secrets"] == 2 and result["conflicts"] == 7
+    assert result["held_secrets"] == 2 and result["conflicts"] == 7 and result["secret_count"] == 1
     assert not config.db_path.exists()
 
 

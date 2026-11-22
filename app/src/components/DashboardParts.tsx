@@ -1,7 +1,7 @@
 import { Button, ButtonBase, Skeleton } from "@mui/material";
 import type { ReactNode } from "react";
 import { language, t } from "../copy";
-import { formatSyncState } from "../lib/presentation";
+import { formatSyncState, syncAttentionCount } from "../lib/presentation";
 import type { SyncInfo } from "../types";
 import { StatusDot } from "./StatusDot";
 
@@ -40,7 +40,7 @@ export function syncPresentation(sync: SyncInfo | undefined, running: boolean) {
   const state = sync ? formatSyncState(sync) : "never";
   if (running) return { label: t("sync.running"), color: "var(--accent)" };
   if (state === "blocked" || state === "error") return { label: t("sync.stopped"), color: "var(--error)", attention: true };
-  if (sync?.conflicts || sync?.held_secrets) return { label: t("sync.attention"), color: "var(--warning)", attention: true };
+  if (syncAttentionCount(sync)) return { label: t("sync.attention"), color: "var(--warning)", attention: true };
   if (state === "ok") return { label: t("sync.latest"), color: "var(--success)" };
   return { label: t("sync.pending"), color: "var(--muted)" };
 }
