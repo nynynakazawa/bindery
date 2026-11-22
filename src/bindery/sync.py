@@ -2228,6 +2228,11 @@ def install_scheduler(config, interval: int = 300, *, write: bool = False, emit:
         paths.root.mkdir(parents=True, exist_ok=True)
         if kind == "macos":
             atomic_write(first, rendered)
+            # bootstrap refuses a label that is already loaded (error 5) and
+            # launchd keeps running the old definition, so unload it first.
+            # A missing job is the normal first-install case, not an error.
+            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+                           check=False, capture_output=True, timeout=15)
             _run_scheduler_command(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(first)])
         else:
             assert second is not None
