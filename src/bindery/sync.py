@@ -1589,22 +1589,26 @@ def _record_encryptions(state: dict, key_id: str, count: int) -> None:
 
 def _index_after_sync(config, written: list[str]) -> str:
     """Update the index and return a state value without advancing a marker."""
+    # No vault lock here. The index is derived data with its own SQLite
+    # locking, and holding the vault lock while embedding made every agent's
+    # memory_learn time out for minutes. Only the files this sync wrote are
+    # forced; the plain reindex is hash-based, so unchanged notes keep their
+    # vectors instead of being re-embedded on every five-minute run.
     store = None
     try:
-        with vault_lock(config):
-            store = Store(config.db_path)
-            for rel in sorted(set(written)):
-                if rel.lower().endswith(".md"):
-                    index_path(config, store, config.vault / rel, force=True)
-            reindex(config, store, force=True)
-            refresh_embeddings(config, store)
-            if store.ann_enabled:
-                store.rebuild_vector_index()
-            store.commit()
-            if config.semantic:
-                from .embed import load_backend
-                if load_backend() is None:
-                    return "skipped"
+        store = Store(config.db_path)
+        for rel in sorted(set(written)):
+            if rel.lower().endswith(".md"):
+                index_path(config, store, config.vault / rel, force=True)
+        reindex(config, store)
+        refresh_embeddings(config, store)
+        if written and store.ann_enabled:
+            store.rebuild_vector_index()
+        store.commit()
+        if config.semantic:
+            from .embed import load_backend
+            if load_backend() is None:
+                return "skipped"
         return "ok"
     finally:
         if store is not None:

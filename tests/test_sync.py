@@ -1003,3 +1003,26 @@ def test_scheduler_command_stays_in_the_environment_and_parses(tmp_path, monkeyp
     args = build_parser().parse_args(command[1:])
     assert args.command == "sync"
     assert str(args.vault) == str(vault)
+
+
+def test_index_after_sync_neither_locks_the_vault_nor_forces_everything(tmp_path, monkeypatch):
+    """Embedding after a sync took minutes; doing it under the vault lock
+    made every memory_learn time out, and a forced full reindex re-embedded
+    every note on every run."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("# A\\n\\nalpha\\n", encoding="utf-8")
+    config = Config.resolve(vault=vault, state_dir=tmp_path / "state", semantic=False)
+    calls = []
+
+    def spy_reindex(cfg, store, *, force=False):
+        calls.append(force)
+        # A writer must be able to take the vault lock while indexing runs.
+        with sync.vault_lock(cfg, timeout=0.5):
+            pass
+        return real_reindex(cfg, store, force=force)
+
+    real_reindex = sync.reindex
+    monkeypatch.setattr(sync, "reindex", spy_reindex)
+    assert sync._index_after_sync(config, ["a.md"]) in {"ok", "skipped"}
+    assert calls == [False]
