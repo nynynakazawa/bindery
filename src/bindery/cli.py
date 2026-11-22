@@ -14,6 +14,10 @@ import re
 import shutil
 import sqlite3
 import sys
+import subprocess
+import datetime as _dt
+import tomllib
+import shlex
 from pathlib import Path
 
 from . import __version__
@@ -206,19 +210,20 @@ def _read_status_db(config: Config) -> dict | None:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    from .embed import load_backend
-
     config = _config_from(args)
     explicitly_configured = bool(
         getattr(args, "vault", None) or os.environ.get("BINDERY_VAULT", "").strip()
     )
     db_info = _read_status_db(config) if explicitly_configured else None
     stats = (db_info or {"stats": {"notes": 0, "chunks": 0, "links": 0, "vectors": 0}})["stats"]
-    backend = (
-        load_backend()
-        if db_info and config.vault.exists() and not db_info.get("migration") and config.semantic
-        else None
-    )
+    backend = None
+    if not getattr(args, "json", False):
+        from .embed import load_backend
+        backend = (
+            load_backend()
+            if db_info and config.vault.exists() and not db_info.get("migration") and config.semantic
+            else None
+        )
 
     problems: list[str] = []
     if not explicitly_configured:
@@ -233,12 +238,29 @@ def cmd_status(args: argparse.Namespace) -> int:
         problems.append("index needs migration or rebuild; run: bindery index")
     elif stats["notes"] == 0:
         problems.append(f"vault has no indexed Markdown notes: {config.vault}")
-    if config.semantic and db_info and not db_info.get("migration") and backend is None:
+    if not getattr(args, "json", False) and config.semantic and db_info and not db_info.get("migration") and backend is None:
         problems.append("semantic search requested but no backend installed "
                         "(uv tool install --force 'bindery-mcp[semantic]') - keyword search still works")
     if backend is not None and stats["vectors"] < stats["chunks"]:
         problems.append(f"{stats['chunks'] - stats['vectors']} passage(s) not embedded yet "
                         "(run: bindery index --embed)")
+
+    if getattr(args, "json", False):
+        problems = list(problems)
+        payload = {
+            "version": __version__,
+            "vault": str(config.vault),
+            "vault_exists": config.vault.exists(),
+            "indexed": bool(db_info and not db_info.get("migration") and not db_info.get("unreadable")),
+            "notes": stats["notes"] if db_info else None,
+            "passages": stats["chunks"] if db_info else None,
+            "embedded": stats["vectors"] if db_info else None,
+            "semantic": "configured" if config.semantic else "off (keyword only)",
+            "state_dir": str(config.state_dir),
+            "error": "; ".join(problems) if problems else None,
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
 
     print(f"bindery {__version__}")
     print(f"  vault          {config.vault}")
@@ -261,6 +283,165 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         print("\nready")
     return 1 if problems else 0
+
+
+def _registered_vault(spec: dict) -> str | None:
+    path = Path(spec["path"])
+    if not path.is_file():
+        return None
+    try:
+        if spec["format"] == "toml":
+            value = tomllib.loads(path.read_text(encoding="utf-8"))
+            entry = value.get("mcp_servers", {}).get("bindery", {})
+        else:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            entry = value.get(spec["format"], {}).get("bindery", {})
+        args = entry.get("args", []) if isinstance(entry, dict) else []
+        if "--vault" in args:
+            return str(args[args.index("--vault") + 1])
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, IndexError):
+        return None
+    return None
+
+
+def _classify_process(command: str) -> str:
+    lower = command.lower()
+    if "antigravity" in lower or re.search(r"\bagy\b", lower):
+        return "antigravity"
+    if "claude" in lower:
+        return "claude"
+    if "codex" in lower:
+        return "codex"
+    return "unknown"
+
+
+def _process_vault(command: str) -> str | None:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    try:
+        return parts[parts.index("--vault") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _connections() -> list[dict]:
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,lstart=,command="],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows: dict[int, dict] = {}
+    for line in result.stdout.splitlines():
+        match = re.match(r"\s*(\d+)\s+(\d+)\s+(.{24})\s+(.*)", line)
+        if not match:
+            continue
+        pid, ppid = int(match.group(1)), int(match.group(2))
+        started = None
+        try:
+            started = _dt.datetime.strptime(match.group(3), "%a %b %d %H:%M:%S %Y").replace(tzinfo=_dt.datetime.now().astimezone().tzinfo).isoformat()
+        except ValueError:
+            pass
+        rows[pid] = {"pid": pid, "ppid": ppid, "command": match.group(4), "started_at": started}
+    found: list[dict] = []
+    for row in rows.values():
+        if "bindery" not in row["command"] or "serve" not in row["command"]:
+            continue
+        current = row
+        client = "unknown"
+        visited: set[int] = set()
+        while current and current["pid"] not in visited:
+            visited.add(current["pid"])
+            detected = _classify_process(current["command"])
+            if detected != "unknown" and "bindery" not in current["command"].lower():
+                client = detected
+                break
+            current = rows.get(current["ppid"])
+        found.append({"client": client, "pid": row["pid"], "started_at": row["started_at"], "vault": _process_vault(row["command"])})
+    return sorted(found, key=lambda item: item["pid"])
+
+
+def cmd_clients(args: argparse.Namespace) -> int:
+    config = _config_from(args)
+    targets = _client_targets(config, "user")
+    clients = []
+    for client_id, spec in sorted(targets.items()):
+        # The JSON contract uses the canonical IDs for the three primary
+        # clients, while account-specific Codex profiles remain visible.
+        canonical = client_id.split(":", 1)[0]
+        clients.append({
+            "id": canonical,
+            "label": spec["label"],
+            "detected": canonical in _detect_clients() or client_id in _detect_clients(),
+            "registered": _registered_vault(spec) is not None,
+            "config_path": str(spec["path"]),
+            "vault": _registered_vault(spec),
+        })
+    payload = {"clients": clients, "connections": _connections(), "error": None}
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+def _sync_result_output(result, *, json_output: bool) -> int:
+    if json_output:
+        print(json.dumps({"exit_code": result.exit_code, "status": result.status}, ensure_ascii=False))
+        return 0
+    if result.message:
+        print(result.message)
+    print(json.dumps(result.status, ensure_ascii=False, indent=2))
+    return result.exit_code
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    from . import sync
+
+    config = _config_from(args)
+    action = getattr(args, "sync_action", "run")
+    if action == "status":
+        payload = sync.sync_status(config)
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if action == "init":
+        result = sync.init_sync(config, args.remote, write=args.write, allow_public_host=args.allow_public_host)
+        return _sync_result_output(result, json_output=getattr(args, "json", False))
+    if action == "pair":
+        result = sync.pair(
+            config,
+            args.host,
+            replace=args.replace,
+            remote_vault=args.remote_vault,
+            remote_bindery=getattr(args, "remote_bindery", None),
+        )
+        return _sync_result_output(result, json_output=getattr(args, "json", False))
+    if action == "accept-key":
+        result = sync.accept_key(config, args.sync_id, sys.stdin.buffer.read(), replace=args.replace)
+        return _sync_result_output(result, json_output=getattr(args, "json", False))
+    if action == "key-export":
+        try:
+            print(sync.key_export(config))
+            return 0
+        except Exception as exc:
+            print(f"! {exc}", file=sys.stderr)
+            return 1
+    if action == "install":
+        json_output = getattr(args, "json", False)
+        result = sync.install_scheduler(config, args.interval, write=args.write, emit=not json_output)
+        return _sync_result_output(result, json_output=json_output)
+    if action == "uninstall":
+        json_output = getattr(args, "json", False)
+        result = sync.uninstall_scheduler(config, write=args.write, emit=not json_output)
+        return _sync_result_output(result, json_output=json_output)
+    if action == "rekey":
+        result = sync.rekey(config, write=args.write, purge_remote=args.purge_remote)
+        return _sync_result_output(result, json_output=getattr(args, "json", False))
+    result = sync.run_sync(config, allow_public_host=getattr(args, "allow_public_host", False))
+    return _sync_result_output(result, json_output=getattr(args, "json", False))
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -1128,7 +1309,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Show index health. Exits non-zero on problems.")
     _add_common(p_status, suppress_defaults=True)
     _add_project(p_status, suppress_defaults=True)
+    p_status.add_argument("--json", action="store_true", help="Emit the Bindery.app JSON contract.")
     p_status.set_defaults(func=cmd_status)
+
+    p_clients = sub.add_parser("clients", help="Show detected and registered agent clients.")
+    _add_common(p_clients, suppress_defaults=True)
+    _add_project(p_clients, suppress_defaults=True)
+    p_clients.add_argument("--json", action="store_true", help="Emit the Bindery.app JSON contract.")
+    p_clients.set_defaults(func=cmd_clients)
 
     p_review = sub.add_parser("review", help="Show how the memory is growing and what needs attention.")
     _add_common(p_review, suppress_defaults=True)
@@ -1186,6 +1374,74 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Write to the user-level agent instruction files, including "
                                "~/.gemini/GEMINI.md when ~/.gemini exists.")
     p_prompt.set_defaults(func=cmd_prompt)
+
+    p_sync = sub.add_parser("sync", help="Synchronise a vault through an encrypted Git transport.")
+    _add_common(p_sync, suppress_defaults=True)
+    _add_project(p_sync, suppress_defaults=True)
+    p_sync.add_argument("--json", action="store_true", help="Emit one JSON object and return zero.")
+    p_sync.add_argument("--allow-public-host", action="store_true", help="Allow an explicitly selected public Git host.")
+    sync_sub = p_sync.add_subparsers(dest="sync_action")
+
+    def _sync_common(parser):
+        _add_common(parser, suppress_defaults=True)
+        _add_project(parser, suppress_defaults=True)
+
+    p_sync.set_defaults(func=cmd_sync, sync_action="run")
+    p_sync_status = sync_sub.add_parser("status", help="Show encrypted sync state.")
+    _sync_common(p_sync_status)
+    p_sync_status.add_argument("--json", action="store_true")
+    p_sync_status.set_defaults(func=cmd_sync, sync_action="status")
+
+    p_sync_init = sync_sub.add_parser("init", help="Configure an encrypted remote.")
+    _sync_common(p_sync_init)
+    p_sync_init.add_argument("--remote", required=True)
+    p_sync_init.add_argument("--write", action="store_true")
+    p_sync_init.add_argument("--json", action="store_true")
+    p_sync_init.add_argument("--allow-public-host", action="store_true")
+    p_sync_init.set_defaults(func=cmd_sync, sync_action="init")
+
+    p_sync_pair = sync_sub.add_parser("pair", help="Send the key over SSH without putting it in argv.")
+    _sync_common(p_sync_pair)
+    p_sync_pair.add_argument("host")
+    p_sync_pair.add_argument("--replace", action="store_true")
+    p_sync_pair.add_argument("--remote-vault", help="Absolute Vault path on the peer machine.")
+    p_sync_pair.add_argument("--remote-bindery", help="Absolute bindery executable on the peer machine.")
+    p_sync_pair.add_argument("--json", action="store_true")
+    p_sync_pair.set_defaults(func=cmd_sync, sync_action="pair")
+
+    p_accept = sync_sub.add_parser("accept-key", help="Receive a key on stdin from a trusted peer.")
+    _sync_common(p_accept)
+    p_accept.add_argument("--sync-id", required=True)
+    p_accept.add_argument("--replace", action="store_true")
+    p_accept.add_argument("--json", action="store_true")
+    p_accept.set_defaults(func=cmd_sync, sync_action="accept-key")
+
+    p_key = sync_sub.add_parser("key", help="Key recovery operations.")
+    _sync_common(p_key)
+    key_sub = p_key.add_subparsers(dest="key_action", required=True)
+    p_export = key_sub.add_parser("export", help="Print a recovery string.")
+    _sync_common(p_export)
+    p_export.set_defaults(func=cmd_sync, sync_action="key-export")
+
+    p_install_sync = sync_sub.add_parser("install", help="Install the opt-in scheduler.")
+    _sync_common(p_install_sync)
+    p_install_sync.add_argument("--interval", type=int, default=300)
+    p_install_sync.add_argument("--write", action="store_true")
+    p_install_sync.add_argument("--json", action="store_true")
+    p_install_sync.set_defaults(func=cmd_sync, sync_action="install")
+
+    p_uninstall_sync = sync_sub.add_parser("uninstall", help="Remove the scheduler.")
+    _sync_common(p_uninstall_sync)
+    p_uninstall_sync.add_argument("--write", action="store_true")
+    p_uninstall_sync.add_argument("--json", action="store_true")
+    p_uninstall_sync.set_defaults(func=cmd_sync, sync_action="uninstall")
+
+    p_rekey = sync_sub.add_parser("rekey", help="Replace the encryption root (explicit and destructive).")
+    _sync_common(p_rekey)
+    p_rekey.add_argument("--write", action="store_true")
+    p_rekey.add_argument("--purge-remote", action="store_true")
+    p_rekey.add_argument("--json", action="store_true")
+    p_rekey.set_defaults(func=cmd_sync, sync_action="rekey")
 
     return parser
 

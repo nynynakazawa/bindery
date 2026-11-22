@@ -44,6 +44,7 @@ from .growth import (
 )
 from .indexer import index_path, is_indexable, refresh_embeddings, reindex
 from .safeio import update_text
+from .sync import machine_label, sync_is_configured, sync_marker, sync_status, vault_lock
 from .search import count_outside_scope, search
 from .store import Store
 from .tokens import estimate_tokens
@@ -82,6 +83,19 @@ class MemoryServer:
         #: is what turns an impression into evidence that it was useful.
         #: Bounded because a long session must not accumulate without limit.
         self._offered: dict[str, None] = {}
+        self._sync_marker = sync_marker(self.config)
+
+    def _refresh_after_sync(self) -> None:
+        """Follow a completed sync without restarting the MCP process."""
+        marker = sync_marker(self.config)
+        if marker is None or marker == self._sync_marker:
+            return
+        with vault_lock(self.config):
+            reindex(self.config, self.store)
+            refresh_embeddings(self.config, self.store)
+            if self.store.ann_enabled:
+                self.store.rebuild_vector_index()
+        self._sync_marker = marker
 
     def _import_episodes(self) -> None:
         """Capture sessions the other agents finished while we were not running.
@@ -282,11 +296,12 @@ class MemoryServer:
                 front.append("tags: [" + ", ".join(str(t) for t in tags) + "]")
             front.append("---")
             front.append("")
-        target.parent.mkdir(parents=True, exist_ok=True)
         body = "\n".join([*front, content]).rstrip() + "\n"
         # Locked even though this is a whole-file replace, so that it cannot
         # land in the middle of a concurrent read-modify-write of the same note.
-        update_text(target, lambda _current: body, lock_dir=self.config.state_dir)
+        with vault_lock(self.config):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            update_text(target, lambda _current: body, lock_dir=self.config.state_dir)
 
         self._index_written(rel)
         if args.get("pin"):
@@ -317,12 +332,11 @@ class MemoryServer:
         # One journal per project per day. A single global journal would make
         # every day's entries a mixture of unrelated codebases, which is the
         # one file a scoped search can never usefully filter.
-        rel = f"journal/{project}/{today}.md" if project else f"journal/{today}.md"
+        suffix = f".{machine_label(self.config)}" if sync_is_configured(self.config) else ""
+        rel = f"journal/{project}/{today}{suffix}.md" if project else f"journal/{today}{suffix}.md"
         target = self._safe_path(rel)
         if target is None:
             return "Refused: journal path resolved outside the vault."
-        target.parent.mkdir(parents=True, exist_ok=True)
-
         stamp = datetime.datetime.now().strftime("%H:%M")
 
         def append_entry(current: str) -> str:
@@ -360,7 +374,9 @@ class MemoryServer:
             # header already ends in a blank line; body starts at the H1.
             return "\n".join(header) + body.lstrip("\n") + "\n"
 
-        update_text(target, append_entry, lock_dir=self.config.state_dir)
+        with vault_lock(self.config):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            update_text(target, append_entry, lock_dir=self.config.state_dir)
         self._index_written(rel)
         self.session.learned += 1
         return f"Recorded in {rel} (~{estimate_tokens(content)} tokens)." + (
@@ -480,6 +496,7 @@ class MemoryServer:
                 "projects_indexed": dict(self.store.projects()),
                 "indexed_only": self.config.include or "(whole vault)",
                 "never_indexed": self.config.exclude or [],
+                "sync": sync_status(self.config),
             },
             ensure_ascii=False,
             indent=2,
@@ -526,12 +543,11 @@ class MemoryServer:
         if not self.session.worth_recording():
             return None
 
-        rel = f"{SESSION_PREFIX}{datetime.date.today().isoformat()}.md"
+        suffix = f".{machine_label(self.config)}" if sync_is_configured(self.config) else ""
+        rel = f"{SESSION_PREFIX}{datetime.date.today().isoformat()}{suffix}.md"
         target = self._safe_path(rel)
         if target is None:
             return None
-        target.parent.mkdir(parents=True, exist_ok=True)
-
         today = datetime.date.today().isoformat()
         rendered = self.session.render(client=self.client_name)
 
@@ -546,7 +562,9 @@ class MemoryServer:
             body += "\n\n" + rendered
             return header + body.lstrip("\n") + "\n"
 
-        update_text(target, append_record, lock_dir=self.config.state_dir)
+        with vault_lock(self.config):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            update_text(target, append_record, lock_dir=self.config.state_dir)
 
         try:
             index_path(self.config, self.store, target)
@@ -570,6 +588,7 @@ class MemoryServer:
         if handler is None:
             raise KeyError(name)
         with self._lock:
+            self._refresh_after_sync()
             return handler(args)
 
 

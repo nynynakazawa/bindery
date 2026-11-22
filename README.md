@@ -102,7 +102,7 @@ Cut on purpose, to keep the tool surface and the install small:
 
 | Omitted | Why |
 | --- | --- |
-| Cloud sync, team workspaces | Local-first. Your notes are your files. |
+| Hosted cloud sync, team workspaces | Bindery does not run a hosted sync service. Encrypted sync to an opt-in Git remote is available for a remote you control. |
 | Accounts, auth, multi-tenancy | Single-user tool. |
 | LLM-based memory extraction | It would call a paid API on every write - the opposite of the goal. |
 | Whole-codebase AST indexing | A different problem. Use a code-intelligence server alongside this. |
@@ -417,11 +417,99 @@ bindery setup [--write]          # everything below, in one pass
 bindery review [--json] [--min-count N]
 bindery install [claude|codex] [--write]
 bindery prompt [--write] [--global]
+bindery status --json             # one JSON object for Bindery.app
+bindery clients --json            # detected clients and live connections
+bindery sync init --remote <URL>  # preview an encrypted remote
+bindery sync init --remote <URL> --write
+bindery sync                      # one encrypted sync run
+bindery sync status --json
+bindery sync install --interval 300 --write
+bindery sync uninstall --write
 ```
 
 `review` is the one to run every few weeks. It answers: what did the agents keep
 asking that I never wrote down, which notes are doing the work, and what has
 turned into clutter.
+
+## Encrypted vault sync
+
+Bindery can synchronise one Vault between machines through a Git remote that you
+control. The Vault itself is never a Git working tree. Bindery keeps the local
+transport repository under `~/.bindery/sync/<vault-key>/repo`; its Git objects
+contain only `format.json`, `manifest.enc`, and AES-GCM ciphertext blobs named
+by HMAC-derived identifiers.
+
+The remote must be an SSH URL, scp-style destination, `file://` URL, or absolute
+local path. Passwords, `ext::`, HTTP remotes, and public hosts such as GitHub,
+GitLab, and Bitbucket are refused unless `--allow-public-host` is supplied.
+For a private Mac mini on Tailscale, create a bare repository on that machine,
+then run `sync init` and `sync` on the first Vault. On the second machine,
+`sync pair <ssh-host>` sends the key, remote URL, and trust checkpoint over SSH
+standard input, so it can start syncing without `sync init`. Run one sync on
+each machine.
+
+```bash
+git init --bare ~/bindery-sync/zawabooks.git       # on the private host
+bindery sync init --remote nakazawaserver:bindery-sync/zawabooks.git --write
+bindery sync
+bindery sync pair nakazawaserver --replace         # on the first machine
+bindery sync                                            # on the paired machine
+```
+
+The master key is 32 random bytes. Bindery derives separate AES-256-GCM,
+HMAC-name, and key-ID keys with HKDF-SHA256. macOS stores the key in Keychain
+under service `bindery-sync`; other systems use a `0600` file under the state
+directory. The key never enters Git, Vault, logs, state JSON, or process
+arguments. `bindery sync key export` prints a recovery string with a warning;
+store it in a password manager. Losing the key leaves each local plaintext
+Vault intact, but makes the remote ciphertext unreadable.
+
+The manifest is encrypted too. It records relative paths, object IDs, SHA-256
+hashes, byte sizes, and the machine label that last wrote a file. Each
+manifest has a monotonic generation and a `previous_hash` link. Bindery follows
+authenticated manifests back to the accepted checkpoint; Git parent links are
+not used as trust evidence.
+AES-GCM authentication failures, generation rollback, disconnected history,
+unsafe paths, and non-Markdown conflicts stop the run as `blocked`. Markdown
+conflicts keep both versions under a deterministic `.conflict-<sha12>.md` name;
+the content hash decides which version remains at the original path. Generated
+conflict copies are three-way targets too. If the same plan updates such a copy,
+the existing bytes are retained under that copy's own deterministic
+`.conflict-<sha12>.md` name. The
+machine registry is `.bindery-sync/machines.json`, and a reused label with a
+different machine ID is blocked.
+
+If the remote manifest still tracks a path that is now outside the configured
+boundary, sync stops and names the path. Remove it deliberately after checking
+that the deletion should propagate to every machine; Bindery never silently
+untracks it.
+
+This protects note contents and path names in the remote and in transit from a
+remote observer or a tampered remote. It does not protect a machine that has
+both the plaintext Vault and the key. Git still reveals commit count and order,
+file count, ciphertext sizes, and update frequency. The regular-expression
+secret detector can miss short or unknown credential formats. A secret held in
+the local Vault is not sent; it remains visible locally and is reported in
+`sync status`.
+
+The transaction is stored with encrypted object references, so a stopped apply
+can resume without putting plaintext in state. Conflict copies are written
+before the primary path, and an apply hash mismatch discards the plan and
+rescans up to three times in one run. Encryption counts are tracked per key ID
+and increment only for actual encryption calls.
+
+The scheduler is opt-in and defaults to a dry run. `sync install --write`
+creates a user LaunchAgent on macOS or a systemd user service and timer on
+Linux. Before creating a new key, `sync rekey --write` fetches and completes a
+normal sync, including merge, apply, and push. It checks that local and remote
+HEADs match, then uses a force-with-lease push for the new root. If a peer
+changes the remote HEAD while the root is being built, the push is rejected and
+the old key remains active. The old key and local transport repository are
+archived instead of deleted.
+Rekeying requires pairing every machine again. Old Git objects can remain readable with the old key through reflogs,
+unreachable objects, and backups. Removing them requires a separate remote
+maintenance step such as `git reflog expire --expire=now --all && git gc
+--prune=now`; remote backups must be removed separately.
 
 ## Configuration
 

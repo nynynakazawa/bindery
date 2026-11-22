@@ -142,7 +142,7 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
-def atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+def atomic_write(path: Path, text: str | bytes, *, encoding: str = "utf-8") -> None:
     """Replace ``path`` with ``text`` in a single, all-or-nothing step.
 
     The temporary file is created in the destination directory because
@@ -153,10 +153,16 @@ def atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:
     fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
+        if isinstance(text, bytes):
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        else:
+            with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)

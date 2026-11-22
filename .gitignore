@@ -17,3 +17,4 @@ build/
 # `readme` at - making the release un-installable. Repository rules outrank
 # the global file, so keep this here.
 !README.md
+dist-wheel/

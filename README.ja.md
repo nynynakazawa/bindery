@@ -98,7 +98,7 @@ Bindery はこの3つに、ひとつの考え方で答えます。
 
 | 落とした機能                       | 理由                                                                                                                                                         |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| クラウド同期、チームワークスペース | ローカルファースト。ノートはあなたのファイルです。                                                                                                           |
+| ホスト型クラウド同期、チームワークスペース | Bindery は同期サービスを運営しません。利用者が管理する Git リモートへの暗号化同期だけを opt-in で使えます。 |
 | アカウント、認証、マルチテナント   | 個人用ツールだからです。                                                                                                                                     |
 | LLM によるメモリ抽出               | 書き込みのたびに課金 API を呼ぶことになり、目的と正反対です。                                                                                                |
 | コードベース全体の AST 索引        | 別の問題です。必要ならコード解析サーバーを併用してください。                                                                                                 |
@@ -410,10 +410,80 @@ bindery setup [--write]          # 以下をまとめて実行
 bindery review [--json] [--min-count N]
 bindery install [claude|codex] [--write]
 bindery prompt [--write] [--global]
+bindery status --json             # Bindery.app 向けの JSON を1つ出す
+bindery clients --json            # クライアントと接続中のサーバー
+bindery sync init --remote <URL>  # 暗号化リモートの確認だけをする
+bindery sync init --remote <URL> --write
+bindery sync                      # 1回だけ暗号化同期する
+bindery sync status --json
+bindery sync install --interval 300 --write
+bindery sync uninstall --write
 ```
 
 数週間に一度回すべきなのは `review` です。「エージェントが何度も聞いたのに
 書いていなかったこと」「実際に働いているノート」「散らかり始めたもの」が分かります。
+
+## Vault の暗号化同期
+
+Bindery は、利用者が管理する Git リモートを通して Vault を複数の端末で同期できます。
+Vault 自体は Git の作業ツリーにしません。同期用のローカルリポジトリは
+`~/.bindery/sync/<vault-key>/repo` に置き、Git オブジェクトには `format.json`、
+`manifest.enc`、HMAC から作った名前の暗号文だけを保存します。
+
+リモートに使えるのは SSH URL、scp 形式、`file://` URL、絶対パスです。パスワードを含む URL、
+`ext::`、HTTP リモート、GitHub・GitLab・Bitbucket などの公開ホストは拒否します。
+公開ホストを明示的に許可する場合だけ `--allow-public-host` を付けてください。
+Tailscale 上の Mac mini を使う場合は、Mac mini に bare リポジトリを作り、最初の端末で
+`sync init` と `sync` を実行します。2台目は `sync pair <ssh-host>` で SSH の標準入力から鍵、
+リモート URL、信頼チェックポイントを受け取り、`sync init` なしで同期を始められます。
+両方で1回ずつ同期します。
+
+```bash
+git init --bare ~/bindery-sync/zawabooks.git       # 非公開ホスト側
+bindery sync init --remote nakazawaserver:bindery-sync/zawabooks.git --write
+bindery sync
+bindery sync pair nakazawaserver --replace         # 最初の端末から
+bindery sync                                            # ペアリングした端末で
+```
+
+マスター鍵は乱数で作る32バイトです。HKDF-SHA256 で AES-256-GCM 用、名前用 HMAC、鍵 ID 用の
+鍵を分けます。macOS では Keychain の service `bindery-sync` に保存し、それ以外では state
+ディレクトリ内の `0600` ファイルに保存します。鍵は Git、Vault、ログ、state JSON、プロセスの
+引数に出しません。`bindery sync key export` は警告付きで回復用文字列を表示するため、パスワード
+マネージャに保管してください。鍵を失うとリモートの暗号文は読めなくなりますが、各端末の
+平文 Vault は残ります。
+
+manifest も暗号化します。中には相対パス、オブジェクト ID、SHA-256、サイズ、最後に書いた機械
+ラベルを記録します。manifest には単調増加する世代番号と `previous_hash` を持たせます。受信した
+manifest から受理済みチェックポイントまでハッシュ連鎖をたどれない場合は、Git の親関係にかかわらず
+停止します。
+AES-GCM の認証失敗、世代の巻き戻し、履歴の断絶、安全でないパス、Markdown 以外の内容競合は
+`blocked` で停止します。Markdown の競合では両方の版を決定的な
+`.conflict-<sha12>.md` に残し、内容ハッシュの辞書順で大きい版を元のパスに置きます。生成済みの
+衝突コピー自身も 3-way の対象です。同じ計画でそのパスを更新する場合は、既存内容をそのコピーの
+`.conflict-<sha12>.md` に退避します。
+機械登録は `.bindery-sync/machines.json` に保存し、同じラベルを別の機械が使うと停止します。
+リモートの manifest に、現在の境界の外になったパスが残っていれば、パスを表示して同期を止めます。
+全端末へ削除を伝えてよいことを確認してから手動で追跡を外します。Bindery は黙って追跡を外しません。
+
+この方式が守るのは、リモートや通信経路から見たノート本文とパス名です。平文 Vault と鍵を持つ
+端末そのものが侵害された場合は守れません。Git からはコミット数と順序、ファイル数、暗号文の
+サイズ、更新頻度が分かります。秘密検出は正規表現なので、短い値や未知の形式を見逃すことがあります。
+端末内で秘密を検出したファイルは送らず、ローカルに残して `sync status` に保留数を表示します。
+
+計画は state に暗号化 object の参照を保存するため、停止後も残りの書き込みを再開できます。衝突時は
+衝突コピーを先に書き、元パスを最後に書きます。適用中のハッシュ不一致は計画を破棄し、同じ実行内で
+最大3回走査します。暗号化回数は鍵 ID ごとに実際の暗号化だけを数えます。
+
+スケジューラは opt-in で、既定はドライランです。`sync install --write` は macOS ではユーザーの
+LaunchAgent、Linux では systemd user service と timer を作ります。鍵を交換する
+`sync rekey --write` は新しい鍵を作る前に fetch し、通常の同期（統合、適用、push）を成功させます。
+ローカルの同期 HEAD とリモート HEAD が一致したことを確認して新しい根を作り、観測した HEAD を lease
+に指定して force push します。根の作成中に別端末が push して HEAD が変わると push を拒否し、旧鍵を
+残したまま中止します。成功後は旧鍵と旧ローカルリポジトリを退避します。
+全端末の再ペアリングが必要です。古い Git オブジェクトは reflog、到達不能
+オブジェクト、バックアップに残り、旧鍵で読める場合があります。必要ならリモートで
+`git reflog expire --expire=now --all && git gc --prune=now` を実行し、バックアップは別に削除してください。
 
 ## 設定
 
